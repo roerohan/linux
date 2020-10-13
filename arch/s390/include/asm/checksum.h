@@ -40,32 +40,6 @@ csum_partial(const void *buff, int len, __wsum sum)
 }
 
 /*
- * the same as csum_partial_copy, but copies from user space.
- *
- * here even more important to align src and dst on a 32-bit (or even
- * better 64-bit) boundary
- *
- * Copy from userspace and compute checksum.
- */
-static inline __wsum
-csum_partial_copy_from_user(const void __user *src, void *dst,
-                                          int len, __wsum sum,
-                                          int *err_ptr)
-{
-	if (unlikely(copy_from_user(dst, src, len)))
-		*err_ptr = -EFAULT;
-	return csum_partial(dst, len, sum);
-}
-
-
-static inline __wsum
-csum_partial_copy_nocheck (const void *src, void *dst, int len, __wsum sum)
-{
-        memcpy(dst,src,len);
-	return csum_partial(dst, len, sum);
-}
-
-/*
  *      Fold a partial checksum without adding pseudo headers
  */
 static inline __sum16 csum_fold(__wsum sum)

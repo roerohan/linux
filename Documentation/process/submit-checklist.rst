@@ -24,6 +24,10 @@ and elsewhere regarding submitting Linux kernel patches.
 
   c) Builds successfully when using ``O=builddir``
 
+  d) Any Documentation/ changes build successfully without new warnings/errors.
+     Use ``make htmldocs`` or ``make pdfdocs`` to check the build and
+     fix any issues.
+
 3) Builds on multiple CPU architectures by using local cross-compile tools
    or some other build farm.
 
@@ -107,7 +111,7 @@ and elsewhere regarding submitting Linux kernel patches.
     and why.
 
 26) If any ioctl's are added by the patch, then also update
-    ``Documentation/ioctl/ioctl-number.rst``.
+    ``Documentation/userspace-api/ioctl/ioctl-number.rst``.
 
 27) If your modified source code depends on or uses any of the kernel
     APIs or features that are related to the following ``Kconfig`` symbols,

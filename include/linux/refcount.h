@@ -38,11 +38,24 @@
  * atomic operations, then the count will continue to edge closer to 0. If it
  * reaches a value of 1 before /any/ of the threads reset it to the saturated
  * value, then a concurrent refcount_dec_and_test() may erroneously free the
- * underlying object. Given the precise timing details involved with the
- * round-robin scheduling of each thread manipulating the refcount and the need
- * to hit the race multiple times in succession, there doesn't appear to be a
- * practical avenue of attack even if using refcount_add() operations with
- * larger increments.
+ * underlying object.
+ * Linux limits the maximum number of tasks to PID_MAX_LIMIT, which is currently
+ * 0x400000 (and can't easily be raised in the future beyond FUTEX_TID_MASK).
+ * With the current PID limit, if no batched refcounting operations are used and
+ * the attacker can't repeatedly trigger kernel oopses in the middle of refcount
+ * operations, this makes it impossible for a saturated refcount to leave the
+ * saturation range, even if it is possible for multiple uses of the same
+ * refcount to nest in the context of a single task:
+ *
+ *     (UINT_MAX+1-REFCOUNT_SATURATED) / PID_MAX_LIMIT =
+ *     0x40000000 / 0x400000 = 0x100 = 256
+ *
+ * If hundreds of references are added/removed with a single refcounting
+ * operation, it may potentially be possible to leave the saturation range; but
+ * given the precise timing details involved with the round-robin scheduling of
+ * each thread manipulating the refcount and the need to hit the race multiple
+ * times in succession, there doesn't appear to be a practical avenue of attack
+ * even if using refcount_add() operations with larger increments.
  *
  * Memory ordering
  * ===============
@@ -152,7 +165,7 @@ static inline unsigned int refcount_read(const refcount_t *r)
  *
  * Return: false if the passed refcount is 0, true otherwise
  */
-static inline __must_check bool refcount_add_not_zero(int i, refcount_t *r)
+static inline __must_check bool __refcount_add_not_zero(int i, refcount_t *r, int *oldp)
 {
 	int old = refcount_read(r);
 
@@ -161,10 +174,18 @@ static inline __must_check bool refcount_add_not_zero(int i, refcount_t *r)
 			break;
 	} while (!atomic_try_cmpxchg_relaxed(&r->refs, &old, old + i));
 
+	if (oldp)
+		*oldp = old;
+
 	if (unlikely(old < 0 || old + i < 0))
 		refcount_warn_saturate(r, REFCOUNT_ADD_NOT_ZERO_OVF);
 
 	return old;
+}
+
+static inline __must_check bool refcount_add_not_zero(int i, refcount_t *r)
+{
+	return __refcount_add_not_zero(i, r, NULL);
 }
 
 /**
@@ -183,14 +204,22 @@ static inline __must_check bool refcount_add_not_zero(int i, refcount_t *r)
  * cases, refcount_inc(), or one of its variants, should instead be used to
  * increment a reference count.
  */
-static inline void refcount_add(int i, refcount_t *r)
+static inline void __refcount_add(int i, refcount_t *r, int *oldp)
 {
 	int old = atomic_fetch_add_relaxed(i, &r->refs);
+
+	if (oldp)
+		*oldp = old;
 
 	if (unlikely(!old))
 		refcount_warn_saturate(r, REFCOUNT_ADD_UAF);
 	else if (unlikely(old < 0 || old + i < 0))
 		refcount_warn_saturate(r, REFCOUNT_ADD_OVF);
+}
+
+static inline void refcount_add(int i, refcount_t *r)
+{
+	__refcount_add(i, r, NULL);
 }
 
 /**
@@ -206,9 +235,14 @@ static inline void refcount_add(int i, refcount_t *r)
  *
  * Return: true if the increment was successful, false otherwise
  */
+static inline __must_check bool __refcount_inc_not_zero(refcount_t *r, int *oldp)
+{
+	return __refcount_add_not_zero(1, r, oldp);
+}
+
 static inline __must_check bool refcount_inc_not_zero(refcount_t *r)
 {
-	return refcount_add_not_zero(1, r);
+	return __refcount_inc_not_zero(r, NULL);
 }
 
 /**
@@ -223,9 +257,14 @@ static inline __must_check bool refcount_inc_not_zero(refcount_t *r)
  * Will WARN if the refcount is 0, as this represents a possible use-after-free
  * condition.
  */
+static inline void __refcount_inc(refcount_t *r, int *oldp)
+{
+	__refcount_add(1, r, oldp);
+}
+
 static inline void refcount_inc(refcount_t *r)
 {
-	refcount_add(1, r);
+	__refcount_inc(r, NULL);
 }
 
 /**
@@ -248,9 +287,12 @@ static inline void refcount_inc(refcount_t *r)
  *
  * Return: true if the resulting refcount is 0, false otherwise
  */
-static inline __must_check bool refcount_sub_and_test(int i, refcount_t *r)
+static inline __must_check bool __refcount_sub_and_test(int i, refcount_t *r, int *oldp)
 {
 	int old = atomic_fetch_sub_release(i, &r->refs);
+
+	if (oldp)
+		*oldp = old;
 
 	if (old == i) {
 		smp_acquire__after_ctrl_dep();
@@ -261,6 +303,11 @@ static inline __must_check bool refcount_sub_and_test(int i, refcount_t *r)
 		refcount_warn_saturate(r, REFCOUNT_SUB_UAF);
 
 	return false;
+}
+
+static inline __must_check bool refcount_sub_and_test(int i, refcount_t *r)
+{
+	return __refcount_sub_and_test(i, r, NULL);
 }
 
 /**
@@ -276,9 +323,14 @@ static inline __must_check bool refcount_sub_and_test(int i, refcount_t *r)
  *
  * Return: true if the resulting refcount is 0, false otherwise
  */
+static inline __must_check bool __refcount_dec_and_test(refcount_t *r, int *oldp)
+{
+	return __refcount_sub_and_test(1, r, oldp);
+}
+
 static inline __must_check bool refcount_dec_and_test(refcount_t *r)
 {
-	return refcount_sub_and_test(1, r);
+	return __refcount_dec_and_test(r, NULL);
 }
 
 /**
@@ -291,10 +343,20 @@ static inline __must_check bool refcount_dec_and_test(refcount_t *r)
  * Provides release memory ordering, such that prior loads and stores are done
  * before.
  */
+static inline void __refcount_dec(refcount_t *r, int *oldp)
+{
+	int old = atomic_fetch_sub_release(1, &r->refs);
+
+	if (oldp)
+		*oldp = old;
+
+	if (unlikely(old <= 1))
+		refcount_warn_saturate(r, REFCOUNT_DEC_LEAK);
+}
+
 static inline void refcount_dec(refcount_t *r)
 {
-	if (unlikely(atomic_fetch_sub_release(1, &r->refs) <= 1))
-		refcount_warn_saturate(r, REFCOUNT_DEC_LEAK);
+	__refcount_dec(r, NULL);
 }
 
 extern __must_check bool refcount_dec_if_one(refcount_t *r);

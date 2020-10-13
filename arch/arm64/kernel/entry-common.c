@@ -57,7 +57,7 @@ static void notrace el1_dbg(struct pt_regs *regs, unsigned long esr)
 	/*
 	 * The CPU masked interrupts, and we are leaving them masked during
 	 * do_debug_exception(). Update PMR as if we had called
-	 * local_mask_daif().
+	 * local_daif_mask().
 	 */
 	if (system_uses_irq_prio_masking())
 		gic_write_pmr(GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET);
@@ -65,6 +65,13 @@ static void notrace el1_dbg(struct pt_regs *regs, unsigned long esr)
 	do_debug_exception(far, esr, regs);
 }
 NOKPROBE_SYMBOL(el1_dbg);
+
+static void notrace el1_fpac(struct pt_regs *regs, unsigned long esr)
+{
+	local_daif_inherit(regs);
+	do_ptrauth_fault(regs, esr);
+}
+NOKPROBE_SYMBOL(el1_fpac);
 
 asmlinkage void notrace el1_sync_handler(struct pt_regs *regs)
 {
@@ -92,9 +99,12 @@ asmlinkage void notrace el1_sync_handler(struct pt_regs *regs)
 	case ESR_ELx_EC_BRK64:
 		el1_dbg(regs, esr);
 		break;
+	case ESR_ELx_EC_FPAC:
+		el1_fpac(regs, esr);
+		break;
 	default:
 		el1_inv(regs, esr);
-	};
+	}
 }
 NOKPROBE_SYMBOL(el1_sync_handler);
 
@@ -175,7 +185,7 @@ NOKPROBE_SYMBOL(el0_pc);
 static void notrace el0_sp(struct pt_regs *regs, unsigned long esr)
 {
 	user_exit_irqoff();
-	local_daif_restore(DAIF_PROCCTX_NOIRQ);
+	local_daif_restore(DAIF_PROCCTX);
 	do_sp_pc_abort(regs->sp, esr, regs);
 }
 NOKPROBE_SYMBOL(el0_sp);
@@ -187,6 +197,14 @@ static void notrace el0_undef(struct pt_regs *regs)
 	do_undefinstr(regs);
 }
 NOKPROBE_SYMBOL(el0_undef);
+
+static void notrace el0_bti(struct pt_regs *regs)
+{
+	user_exit_irqoff();
+	local_daif_restore(DAIF_PROCCTX);
+	do_bti(regs);
+}
+NOKPROBE_SYMBOL(el0_bti);
 
 static void notrace el0_inv(struct pt_regs *regs, unsigned long esr)
 {
@@ -218,6 +236,14 @@ static void notrace el0_svc(struct pt_regs *regs)
 	do_el0_svc(regs);
 }
 NOKPROBE_SYMBOL(el0_svc);
+
+static void notrace el0_fpac(struct pt_regs *regs, unsigned long esr)
+{
+	user_exit_irqoff();
+	local_daif_restore(DAIF_PROCCTX);
+	do_ptrauth_fault(regs, esr);
+}
+NOKPROBE_SYMBOL(el0_fpac);
 
 asmlinkage void notrace el0_sync_handler(struct pt_regs *regs)
 {
@@ -255,11 +281,17 @@ asmlinkage void notrace el0_sync_handler(struct pt_regs *regs)
 	case ESR_ELx_EC_UNKNOWN:
 		el0_undef(regs);
 		break;
+	case ESR_ELx_EC_BTI:
+		el0_bti(regs);
+		break;
 	case ESR_ELx_EC_BREAKPT_LOW:
 	case ESR_ELx_EC_SOFTSTP_LOW:
 	case ESR_ELx_EC_WATCHPT_LOW:
 	case ESR_ELx_EC_BRK64:
 		el0_dbg(regs, esr);
+		break;
+	case ESR_ELx_EC_FPAC:
+		el0_fpac(regs, esr);
 		break;
 	default:
 		el0_inv(regs, esr);

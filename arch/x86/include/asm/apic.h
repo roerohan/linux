@@ -519,38 +519,13 @@ static inline bool apic_id_is_primary_thread(unsigned int id) { return false; }
 static inline void apic_smt_update(void) { }
 #endif
 
-extern void irq_enter(void);
-extern void irq_exit(void);
+struct msi_msg;
 
-static inline void entering_irq(void)
-{
-	irq_enter();
-	kvm_set_cpu_l1tf_flush_l1d();
-}
-
-static inline void entering_ack_irq(void)
-{
-	entering_irq();
-	ack_APIC_irq();
-}
-
-static inline void ipi_entering_ack_irq(void)
-{
-	irq_enter();
-	ack_APIC_irq();
-	kvm_set_cpu_l1tf_flush_l1d();
-}
-
-static inline void exiting_irq(void)
-{
-	irq_exit();
-}
-
-static inline void exiting_ack_irq(void)
-{
-	ack_APIC_irq();
-	irq_exit();
-}
+#ifdef CONFIG_PCI_MSI
+void x86_vector_msi_compose_msg(struct irq_data *data, struct msi_msg *msg);
+#else
+# define x86_vector_msi_compose_msg NULL
+#endif
 
 extern void ioapic_zap_locks(void);
 

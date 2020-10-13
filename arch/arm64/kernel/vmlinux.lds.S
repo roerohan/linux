@@ -6,25 +6,27 @@
  */
 
 #define RO_EXCEPTION_TABLE_ALIGN	8
+#define RUNTIME_DISCARD_EXIT
 
 #include <asm-generic/vmlinux.lds.h>
 #include <asm/cache.h>
 #include <asm/kernel-pgtable.h>
-#include <asm/thread_info.h>
 #include <asm/memory.h>
 #include <asm/page.h>
-#include <asm/pgtable.h>
 
 #include "image.h"
-
-/* .exit.text needed in case of alternative patching */
-#define ARM_EXIT_KEEP(x)	x
-#define ARM_EXIT_DISCARD(x)
 
 OUTPUT_ARCH(aarch64)
 ENTRY(_text)
 
 jiffies = jiffies_64;
+
+
+#define HYPERVISOR_EXTABLE					\
+	. = ALIGN(SZ_8);					\
+	__start___kvm_ex_table = .;				\
+	*(__kvm_ex_table)					\
+	__stop___kvm_ex_table = .;
 
 #define HYPERVISOR_TEXT					\
 	/*						\
@@ -41,6 +43,7 @@ jiffies = jiffies_64;
 	__hyp_idmap_text_end = .;			\
 	__hyp_text_start = .;				\
 	*(.hyp.text)					\
+	HYPERVISOR_EXTABLE				\
 	__hyp_text_end = .;
 
 #define IDMAP_TEXT					\
@@ -72,8 +75,8 @@ jiffies = jiffies_64;
 
 /*
  * The size of the PE/COFF section that covers the kernel image, which
- * runs from stext to _edata, must be a round multiple of the PE/COFF
- * FileAlignment, which we set to its minimum value of 0x200. 'stext'
+ * runs from _stext to _edata, must be a round multiple of the PE/COFF
+ * FileAlignment, which we set to its minimum value of 0x200. '_stext'
  * itself is 4 KB aligned, so padding out _edata to a 0x200 aligned
  * boundary should be sufficient.
  */
@@ -94,18 +97,13 @@ SECTIONS
 	 * matching the same input section name.  There is no documented
 	 * order of matching.
 	 */
+	DISCARDS
 	/DISCARD/ : {
-		ARM_EXIT_DISCARD(EXIT_TEXT)
-		ARM_EXIT_DISCARD(EXIT_DATA)
-		EXIT_CALL
-		*(.discard)
-		*(.discard.*)
 		*(.interp .dynamic)
 		*(.dynsym .dynstr .hash .gnu.hash)
-		*(.eh_frame)
 	}
 
-	. = KIMAGE_VADDR + TEXT_OFFSET;
+	. = KIMAGE_VADDR;
 
 	.head.text : {
 		_text = .;
@@ -131,6 +129,14 @@ SECTIONS
 		*(.got)			/* Global offset table		*/
 	}
 
+	/*
+	 * Make sure that the .got.plt is either completely empty or it
+	 * contains only the lazy dispatch entries.
+	 */
+	.got.plt : { *(.got.plt) }
+	ASSERT(SIZEOF(.got.plt) == 0 || SIZEOF(.got.plt) == 0x18,
+	       "Unexpected GOT/PLT entries detected!")
+
 	. = ALIGN(SEGMENT_ALIGN);
 	_etext = .;			/* End of text section */
 
@@ -139,6 +145,7 @@ SECTIONS
 
 	idmap_pg_dir = .;
 	. += IDMAP_DIR_SIZE;
+	idmap_pg_end = .;
 
 #ifdef CONFIG_UNMAP_KERNEL_AT_EL0
 	tramp_pg_dir = .;
@@ -161,7 +168,7 @@ SECTIONS
 
 	__exittext_begin = .;
 	.exit.text : {
-		ARM_EXIT_KEEP(EXIT_TEXT)
+		EXIT_TEXT
 	}
 	__exittext_end = .;
 
@@ -171,11 +178,8 @@ SECTIONS
 		*(.altinstructions)
 		__alt_instructions_end = .;
 	}
-	.altinstr_replacement : {
-		*(.altinstr_replacement)
-	}
 
-	. = ALIGN(PAGE_SIZE);
+	. = ALIGN(SEGMENT_ALIGN);
 	__inittext_end = .;
 	__initdata_begin = .;
 
@@ -188,7 +192,7 @@ SECTIONS
 		*(.init.rodata.* .init.bss)	/* from the EFI stub */
 	}
 	.exit.data : {
-		ARM_EXIT_KEEP(EXIT_DATA)
+		EXIT_DATA
 	}
 
 	PERCPU_SECTION(L1_CACHE_BYTES)
@@ -246,12 +250,27 @@ SECTIONS
 	. += INIT_DIR_SIZE;
 	init_pg_end = .;
 
+	. = ALIGN(SEGMENT_ALIGN);
 	__pecoff_data_size = ABSOLUTE(. - __initdata_begin);
 	_end = .;
 
 	STABS_DEBUG
+	DWARF_DEBUG
+	ELF_DETAILS
 
 	HEAD_SYMBOLS
+
+	/*
+	 * Sections that should stay zero sized, which is safer to
+	 * explicitly check instead of blindly discarding.
+	 */
+	.plt : {
+		*(.plt) *(.plt.*) *(.iplt) *(.igot)
+	}
+	ASSERT(SIZEOF(.plt) == 0, "Unexpected run-time procedure linkages detected!")
+
+	.data.rel.ro : { *(.data.rel.ro) }
+	ASSERT(SIZEOF(.data.rel.ro) == 0, "Unexpected RELRO detected!")
 }
 
 #include "image-vars.h"
@@ -275,4 +294,4 @@ ASSERT((__entry_tramp_text_end - __entry_tramp_text_start) == PAGE_SIZE,
 /*
  * If padding is applied before .head.text, virt<->phys conversions will fail.
  */
-ASSERT(_text == (KIMAGE_VADDR + TEXT_OFFSET), "HEAD is misaligned")
+ASSERT(_text == KIMAGE_VADDR, "HEAD is misaligned")
