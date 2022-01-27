@@ -321,6 +321,18 @@ static struct gmin_cfg_var i8880_vars[] = {
 	{},
 };
 
+/*
+ * Surface 3 does not describe CsiPort/CsiLanes in both DSDT and EFI.
+ */
+static struct gmin_cfg_var surface3_vars[] = {
+	{"APTA0330:00_CsiPort", "0"},
+	{"APTA0330:00_CsiLanes", "2"},
+
+	{"OVTI8835:00_CsiPort", "1"},
+	{"OVTI8835:00_CsiLanes", "4"},
+	{},
+};
+
 static const struct dmi_system_id gmin_vars[] = {
 	{
 		.ident = "BYT-T FFD8",
@@ -357,6 +369,13 @@ static const struct dmi_system_id gmin_vars[] = {
 			DMI_MATCH(DMI_BOARD_NAME, "VTA0803"),
 		},
 		.driver_data = i8880_vars,
+	},
+	{
+		.ident = "Surface 3",
+		.matches = {
+			DMI_MATCH(DMI_BOARD_NAME, "Surface 3"),
+		},
+		.driver_data = surface3_vars,
 	},
 	{}
 };
@@ -481,7 +500,7 @@ fail:
 
 static u8 gmin_get_pmic_id_and_addr(struct device *dev)
 {
-	struct i2c_client *power;
+	struct i2c_client *power = NULL;
 	static u8 pmic_i2c_addr;
 
 	if (pmic_id)
@@ -817,6 +836,9 @@ static int gmin_v1p8_ctrl(struct v4l2_subdev *subdev, int on)
 	int ret;
 	int value;
 
+	if (!gs || gs->v1p8_on == on)
+		return 0;
+
 	if (gs->v1p8_gpio >= 0) {
 		pr_info("atomisp_gmin_platform: 1.8v power on GPIO %d\n",
 			gs->v1p8_gpio);
@@ -827,8 +849,6 @@ static int gmin_v1p8_ctrl(struct v4l2_subdev *subdev, int on)
 			pr_err("V1P8 GPIO initialization failed\n");
 	}
 
-	if (!gs || gs->v1p8_on == on)
-		return 0;
 	gs->v1p8_on = on;
 
 	if (gs->v1p8_gpio >= 0)
@@ -871,6 +891,9 @@ static int gmin_v2p8_ctrl(struct v4l2_subdev *subdev, int on)
 	int ret;
 	int value;
 
+	if (WARN_ON(!gs))
+		return -ENODEV;
+
 	if (gs->v2p8_gpio >= 0) {
 		pr_info("atomisp_gmin_platform: 2.8v power on GPIO %d\n",
 			gs->v2p8_gpio);
@@ -881,7 +904,7 @@ static int gmin_v2p8_ctrl(struct v4l2_subdev *subdev, int on)
 			pr_err("V2P8 GPIO initialization failed\n");
 	}
 
-	if (!gs || gs->v2p8_on == on)
+	if (gs->v2p8_on == on)
 		return 0;
 	gs->v2p8_on = on;
 
@@ -1036,10 +1059,10 @@ static struct camera_sensor_platform_data acpi_gmin_plat = {
 	.get_vcm_ctrl = gmin_get_vcm_ctrl,
 };
 
-struct camera_sensor_platform_data *gmin_camera_platform_data(
-    struct v4l2_subdev *subdev,
-    enum atomisp_input_format csi_format,
-    enum atomisp_bayer_order csi_bayer)
+struct camera_sensor_platform_data *
+gmin_camera_platform_data(struct v4l2_subdev *subdev,
+			  enum atomisp_input_format csi_format,
+			  enum atomisp_bayer_order csi_bayer)
 {
 	u8 pmic_i2c_addr = gmin_detect_pmic(subdev);
 	struct gmin_subdev *gs;

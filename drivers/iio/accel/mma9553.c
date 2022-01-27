@@ -917,7 +917,7 @@ static const struct iio_enum mma9553_calibgender_enum = {
 
 static const struct iio_chan_spec_ext_info mma9553_ext_info[] = {
 	IIO_ENUM("calibgender", IIO_SHARED_BY_TYPE, &mma9553_calibgender_enum),
-	IIO_ENUM_AVAILABLE("calibgender", &mma9553_calibgender_enum),
+	IIO_ENUM_AVAILABLE("calibgender", IIO_SHARED_BY_TYPE, &mma9553_calibgender_enum),
 	{},
 };
 
@@ -1154,7 +1154,6 @@ static int mma9553_remove(struct i2c_client *client)
 
 	pm_runtime_disable(&client->dev);
 	pm_runtime_set_suspended(&client->dev);
-	pm_runtime_put_noidle(&client->dev);
 
 	mutex_lock(&data->mutex);
 	mma9551_set_device_state(data->client, false);

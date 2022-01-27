@@ -142,7 +142,7 @@ static void uniphier_spi_set_mode(struct spi_device *spi)
 	 * FSTRT    start frame timing
 	 *          0: rising edge of clock, 1: falling edge of clock
 	 */
-	switch (spi->mode & (SPI_CPOL | SPI_CPHA)) {
+	switch (spi->mode & SPI_MODE_X_MASK) {
 	case SPI_MODE_0:
 		/* CKPHS=1, CKINIT=0, CKDLY=1, FSTRT=0 */
 		val1 = SSI_CKS_CKPHS | SSI_CKS_CKDLY;
@@ -767,12 +767,13 @@ out_master_put:
 
 static int uniphier_spi_remove(struct platform_device *pdev)
 {
-	struct uniphier_spi_priv *priv = platform_get_drvdata(pdev);
+	struct spi_master *master = platform_get_drvdata(pdev);
+	struct uniphier_spi_priv *priv = spi_master_get_devdata(master);
 
-	if (priv->master->dma_tx)
-		dma_release_channel(priv->master->dma_tx);
-	if (priv->master->dma_rx)
-		dma_release_channel(priv->master->dma_rx);
+	if (master->dma_tx)
+		dma_release_channel(master->dma_tx);
+	if (master->dma_rx)
+		dma_release_channel(master->dma_rx);
 
 	clk_disable_unprepare(priv->clk);
 

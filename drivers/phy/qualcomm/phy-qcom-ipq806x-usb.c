@@ -127,12 +127,13 @@ struct phy_drvdata {
 };
 
 /**
- * Write register and read back masked value to confirm it is written
+ * usb_phy_write_readback() - Write register and read back masked value to
+ * confirm it is written
  *
- * @base - QCOM DWC3 PHY base virtual address.
- * @offset - register offset.
- * @mask - register bitmask specifying what should be updated
- * @val - value to write.
+ * @phy_dwc3: QCOM DWC3 phy context
+ * @offset: register offset.
+ * @mask: register bitmask specifying what should be updated
+ * @val: value to write.
  */
 static inline void usb_phy_write_readback(struct usb_phy *phy_dwc3,
 					  u32 offset,
@@ -171,11 +172,11 @@ static int wait_for_latch(void __iomem *addr)
 }
 
 /**
- * Write SSPHY register
+ * usb_ss_write_phycreg() - Write SSPHY register
  *
- * @base - QCOM DWC3 PHY base virtual address.
- * @addr - SSPHY address to write.
- * @val - value to write.
+ * @phy_dwc3: QCOM DWC3 phy context
+ * @addr: SSPHY address to write.
+ * @val: value to write.
  */
 static int usb_ss_write_phycreg(struct usb_phy *phy_dwc3,
 				u32 addr, u32 val)
@@ -209,10 +210,11 @@ err_wait:
 }
 
 /**
- * Read SSPHY register.
+ * usb_ss_read_phycreg() - Read SSPHY register.
  *
- * @base - QCOM DWC3 PHY base virtual address.
- * @addr - SSPHY address to read.
+ * @phy_dwc3: QCOM DWC3 phy context
+ * @addr: SSPHY address to read.
+ * @val: pointer in which read is store.
  */
 static int usb_ss_read_phycreg(struct usb_phy *phy_dwc3,
 			       u32 addr, u32 *val)
@@ -276,8 +278,8 @@ static int qcom_ipq806x_usb_hs_phy_init(struct phy *phy)
 	val = HSUSB_CTRL_DPSEHV_CLAMP | HSUSB_CTRL_DMSEHV_CLAMP |
 		HSUSB_CTRL_RETENABLEN  | HSUSB_CTRL_COMMONONN |
 		HSUSB_CTRL_OTGSESSVLD_CLAMP | HSUSB_CTRL_ID_HV_CLAMP |
-		HSUSB_CTRL_DPSEHV_CLAMP | HSUSB_CTRL_UTMI_OTG_VBUS_VALID |
-		HSUSB_CTRL_UTMI_CLK_EN | HSUSB_CTRL_CLAMP_EN | 0x70;
+		HSUSB_CTRL_UTMI_OTG_VBUS_VALID | HSUSB_CTRL_UTMI_CLK_EN |
+		HSUSB_CTRL_CLAMP_EN | 0x70;
 
 	/* use core clock if external reference is not present */
 	if (!phy_dwc3->xo_clk)

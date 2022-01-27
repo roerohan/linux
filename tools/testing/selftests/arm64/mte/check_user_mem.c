@@ -33,7 +33,8 @@ static int check_usermem_access_fault(int mem_type, int mode, int mapping)
 	if (fd == -1)
 		return KSFT_FAIL;
 	for (i = 0; i < len; i++)
-		write(fd, &val, sizeof(val));
+		if (write(fd, &val, sizeof(val)) != sizeof(val))
+			return KSFT_FAIL;
 	lseek(fd, 0, 0);
 	ptr = mte_allocate_memory(len, mem_type, mapping, true);
 	if (check_allocated_memory(ptr, len, mem_type, true) != KSFT_PASS) {
@@ -92,8 +93,12 @@ int main(int argc, char *argv[])
 	err = mte_default_setup();
 	if (err)
 		return err;
+
 	/* Register signal handlers */
 	mte_register_signal(SIGSEGV, mte_default_handler);
+
+	/* Set test plan */
+	ksft_set_plan(4);
 
 	evaluate_test(check_usermem_access_fault(USE_MMAP, MTE_SYNC_ERR, MAP_PRIVATE),
 		"Check memory access from kernel in sync mode, private mapping and mmap memory\n");

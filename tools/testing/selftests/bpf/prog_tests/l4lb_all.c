@@ -30,7 +30,7 @@ static void test_l4lb(const char *file)
 	char buf[128];
 	u32 *magic = (u32 *)buf;
 
-	err = bpf_prog_load(file, BPF_PROG_TYPE_SCHED_CLS, &obj, &prog_fd);
+	err = bpf_prog_test_load(file, BPF_PROG_TYPE_SCHED_CLS, &obj, &prog_fd);
 	if (CHECK_FAIL(err))
 		return;
 
@@ -80,9 +80,8 @@ out:
 
 void test_l4lb_all(void)
 {
-	const char *file1 = "./test_l4lb.o";
-	const char *file2 = "./test_l4lb_noinline.o";
-
-	test_l4lb(file1);
-	test_l4lb(file2);
+	if (test__start_subtest("l4lb_inline"))
+		test_l4lb("test_l4lb.o");
+	if (test__start_subtest("l4lb_noinline"))
+		test_l4lb("test_l4lb_noinline.o");
 }

@@ -33,7 +33,10 @@ static unsigned long read_sysfs(char *str)
 		ksft_print_msg("ERR: missing %s\n", str);
 		return 0;
 	}
-	fscanf(f, "%lu", &val);
+	if (fscanf(f, "%lu", &val) != 1) {
+		ksft_print_msg("ERR: parsing %s\n", str);
+		val = 0;
+	}
 	fclose(f);
 	return val;
 }
@@ -140,6 +143,10 @@ int main(int argc, char *argv[])
 	/* Register signal handlers */
 	mte_register_signal(SIGBUS, mte_default_handler);
 	mte_register_signal(SIGSEGV, mte_default_handler);
+
+	/* Set test plan */
+	ksft_set_plan(4);
+
 	/* Enable KSM */
 	mte_ksm_setup();
 

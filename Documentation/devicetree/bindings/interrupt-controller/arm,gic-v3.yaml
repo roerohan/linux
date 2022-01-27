@@ -145,6 +145,19 @@ properties:
         required:
           - affinity
 
+  clocks:
+    maxItems: 1
+
+  clock-names:
+    items:
+      - const: aclk
+
+  power-domains:
+    maxItems: 1
+
+  resets:
+    maxItems: 1
+
 dependencies:
   mbi-ranges: [ msi-controller ]
   msi-controller: [ mbi-ranges ]
@@ -226,6 +239,7 @@ examples:
       };
     };
 
+  - |
     interrupt-controller@2c010000 {
       compatible = "arm,gic-v3";
       #interrupt-cells = <4>;
@@ -241,7 +255,7 @@ examples:
             <0x2c040000 0x2000>,  // GICC
             <0x2c060000 0x2000>,  // GICH
             <0x2c080000 0x2000>;  // GICV
-      interrupts = <1 9 4>;
+      interrupts = <1 9 4 0>;
 
       msi-controller@2c200000 {
         compatible = "arm,gic-v3-its";

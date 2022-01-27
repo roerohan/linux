@@ -17,7 +17,7 @@
  * While the second model, enabled via --multiq option, uses multiple
  * queueing (which refers to one epoll instance per worker). For example,
  * short lived tcp connections in a high throughput httpd server will
- * ditribute the accept()'ing  connections across CPUs. In this case each
+ * distribute the accept()'ing  connections across CPUs. In this case each
  * worker does a limited  amount of processing.
  *
  *             [queue A]  ---> [worker]
@@ -76,7 +76,6 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/types.h>
-#include <internal/cpumap.h>
 #include <perf/cpumap.h>
 
 #include "../util/stat.h"
@@ -199,7 +198,7 @@ static void *workerfn(void *arg)
 
 	do {
 		/*
-		 * Block undefinitely waiting for the IN event.
+		 * Block indefinitely waiting for the IN event.
 		 * In order to stress the epoll_wait(2) syscall,
 		 * call it event per event, instead of a larger
 		 * batch (max)limit.
@@ -343,7 +342,7 @@ static int do_threads(struct worker *worker, struct perf_cpu_map *cpu)
 
 		if (!noaffinity) {
 			CPU_ZERO(&cpuset);
-			CPU_SET(cpu->map[i % cpu->nr], &cpuset);
+			CPU_SET(perf_cpu_map__cpu(cpu, i % perf_cpu_map__nr(cpu)).cpu, &cpuset);
 
 			ret = pthread_attr_setaffinity_np(&thread_attr, sizeof(cpu_set_t), &cpuset);
 			if (ret)
@@ -453,7 +452,7 @@ int bench_epoll_wait(int argc, const char **argv)
 
 	/* default to the number of CPUs and leave one for the writer pthread */
 	if (!nthreads)
-		nthreads = cpu->nr - 1;
+		nthreads = perf_cpu_map__nr(cpu) - 1;
 
 	worker = calloc(nthreads, sizeof(*worker));
 	if (!worker) {

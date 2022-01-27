@@ -80,6 +80,18 @@ Atomic State Helper Reference
 .. kernel-doc:: drivers/gpu/drm/drm_atomic_state_helper.c
    :export:
 
+GEM Atomic Helper Reference
+---------------------------
+
+.. kernel-doc:: drivers/gpu/drm/drm_gem_atomic_helper.c
+   :doc: overview
+
+.. kernel-doc:: include/drm/drm_gem_atomic_helper.h
+   :internal:
+
+.. kernel-doc:: drivers/gpu/drm/drm_gem_atomic_helper.c
+   :export:
+
 Simple KMS Helper Reference
 ===========================
 
@@ -138,6 +150,18 @@ Overview
 
 .. kernel-doc:: drivers/gpu/drm/drm_bridge.c
    :doc: overview
+
+Display Driver Integration
+--------------------------
+
+.. kernel-doc:: drivers/gpu/drm/drm_bridge.c
+   :doc: display driver integration
+
+Special Care with MIPI-DSI bridges
+----------------------------------
+
+.. kernel-doc:: drivers/gpu/drm/drm_bridge.c
+   :doc: special care dsi
 
 Bridge Operations
 -----------------
@@ -410,4 +434,19 @@ Legacy CRTC/Modeset Helper Functions Reference
    :doc: overview
 
 .. kernel-doc:: drivers/gpu/drm/drm_crtc_helper.c
+   :export:
+
+Privacy-screen class
+====================
+
+.. kernel-doc:: drivers/gpu/drm/drm_privacy_screen.c
+   :doc: overview
+
+.. kernel-doc:: include/drm/drm_privacy_screen_driver.h
+   :internal:
+
+.. kernel-doc:: include/drm/drm_privacy_screen_machine.h
+   :internal:
+
+.. kernel-doc:: drivers/gpu/drm/drm_privacy_screen.c
    :export:

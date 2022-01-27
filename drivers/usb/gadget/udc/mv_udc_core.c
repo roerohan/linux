@@ -888,7 +888,7 @@ static int ep_is_stall(struct mv_udc *udc, u8 ep_num, u8 direction)
 static int mv_ep_set_halt_wedge(struct usb_ep *_ep, int halt, int wedge)
 {
 	struct mv_ep *ep;
-	unsigned long flags = 0;
+	unsigned long flags;
 	int status = 0;
 	struct mv_udc *udc;
 
@@ -2084,10 +2084,8 @@ static int mv_udc_remove(struct platform_device *pdev)
 
 	usb_del_gadget_udc(&udc->gadget);
 
-	if (udc->qwork) {
-		flush_workqueue(udc->qwork);
+	if (udc->qwork)
 		destroy_workqueue(udc->qwork);
-	}
 
 	/* free memory allocated in probe */
 	dma_pool_destroy(udc->dtd_pool);

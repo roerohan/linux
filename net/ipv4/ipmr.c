@@ -195,10 +195,6 @@ static int ipmr_rule_match(struct fib_rule *rule, struct flowi *fl, int flags)
 	return 1;
 }
 
-static const struct nla_policy ipmr_rule_policy[FRA_MAX + 1] = {
-	FRA_GENERIC_POLICY,
-};
-
 static int ipmr_rule_configure(struct fib_rule *rule, struct sk_buff *skb,
 			       struct fib_rule_hdr *frh, struct nlattr **tb,
 			       struct netlink_ext_ack *extack)
@@ -231,7 +227,6 @@ static const struct fib_rules_ops __net_initconst ipmr_rules_ops_template = {
 	.compare	= ipmr_rule_compare,
 	.fill		= ipmr_rule_fill,
 	.nlgroup	= RTNLGRP_IPV4_RULE,
-	.policy		= ipmr_rule_policy,
 	.owner		= THIS_MODULE,
 };
 
@@ -696,7 +691,7 @@ static int vif_delete(struct mr_table *mrt, int vifi, int notify,
 	if (v->flags & (VIFF_TUNNEL | VIFF_REGISTER) && !notify)
 		unregister_netdevice_queue(dev, head);
 
-	dev_put(dev);
+	dev_put_track(dev, &v->dev_tracker);
 	return 0;
 }
 
@@ -896,6 +891,7 @@ static int vif_add(struct net *net, struct mr_table *mrt,
 	/* And finish update writing critical data */
 	write_lock_bh(&mrt_lock);
 	v->dev = dev;
+	netdev_tracker_alloc(dev, &v->dev_tracker, GFP_ATOMIC);
 	if (v->flags & VIFF_REGISTER)
 		mrt->mroute_reg_vif_num = vifi;
 	if (vifi+1 > mrt->maxvif)
@@ -1038,10 +1034,13 @@ static int ipmr_cache_report(struct mr_table *mrt,
 		memcpy(msg, skb_network_header(pkt), sizeof(struct iphdr));
 		msg->im_msgtype = assert;
 		msg->im_mbz = 0;
-		if (assert == IGMPMSG_WRVIFWHOLE)
+		if (assert == IGMPMSG_WRVIFWHOLE) {
 			msg->im_vif = vifi;
-		else
+			msg->im_vif_hi = vifi >> 8;
+		} else {
 			msg->im_vif = mrt->mroute_reg_vif_num;
+			msg->im_vif_hi = mrt->mroute_reg_vif_num >> 8;
+		}
 		ip_hdr(skb)->ihl = sizeof(struct iphdr) >> 2;
 		ip_hdr(skb)->tot_len = htons(ntohs(ip_hdr(pkt)->tot_len) +
 					     sizeof(struct iphdr));
@@ -1054,6 +1053,7 @@ static int ipmr_cache_report(struct mr_table *mrt,
 		ip_hdr(skb)->protocol = 0;
 		msg = (struct igmpmsg *)skb_network_header(skb);
 		msg->im_vif = vifi;
+		msg->im_vif_hi = vifi >> 8;
 		skb_dst_set(skb, dst_clone(skb_dst(pkt)));
 		/* Add our header */
 		igmp = skb_put(skb, sizeof(struct igmphdr));
@@ -1313,7 +1313,7 @@ static void mroute_clean_tables(struct mr_table *mrt, int flags)
 }
 
 /* called from ip_ra_control(), before an RCU grace period,
- * we dont need to call synchronize_rcu() here
+ * we don't need to call synchronize_rcu() here
  */
 static void mrtsock_destruct(struct sock *sk)
 {
@@ -1934,7 +1934,7 @@ static void ip_mr_forward(struct net *net, struct mr_table *mrt,
 	if (c->mfc_origin == htonl(INADDR_ANY) && true_vifi >= 0) {
 		struct mfc_cache *cache_proxy;
 
-		/* For an (*,G) entry, we only check that the incomming
+		/* For an (*,G) entry, we only check that the incoming
 		 * interface is part of the static tree.
 		 */
 		cache_proxy = mr_mfc_find_any_parent(mrt, vif);
@@ -2115,7 +2115,7 @@ int ip_mr_input(struct sk_buff *skb)
 				raw_rcv(mroute_sk, skb);
 				return 0;
 			}
-		    }
+		}
 	}
 
 	/* already under rcu_read_lock() */
@@ -2396,6 +2396,7 @@ static size_t igmpmsg_netlink_msgsize(size_t payloadlen)
 		+ nla_total_size(4)	/* IPMRA_CREPORT_VIF_ID */
 		+ nla_total_size(4)	/* IPMRA_CREPORT_SRC_ADDR */
 		+ nla_total_size(4)	/* IPMRA_CREPORT_DST_ADDR */
+		+ nla_total_size(4)	/* IPMRA_CREPORT_TABLE */
 					/* IPMRA_CREPORT_PKT */
 		+ nla_total_size(payloadlen)
 		;
@@ -2427,11 +2428,12 @@ static void igmpmsg_netlink_event(struct mr_table *mrt, struct sk_buff *pkt)
 	rtgenm = nlmsg_data(nlh);
 	rtgenm->rtgen_family = RTNL_FAMILY_IPMR;
 	if (nla_put_u8(skb, IPMRA_CREPORT_MSGTYPE, msg->im_msgtype) ||
-	    nla_put_u32(skb, IPMRA_CREPORT_VIF_ID, msg->im_vif) ||
+	    nla_put_u32(skb, IPMRA_CREPORT_VIF_ID, msg->im_vif | (msg->im_vif_hi << 8)) ||
 	    nla_put_in_addr(skb, IPMRA_CREPORT_SRC_ADDR,
 			    msg->im_src.s_addr) ||
 	    nla_put_in_addr(skb, IPMRA_CREPORT_DST_ADDR,
-			    msg->im_dst.s_addr))
+			    msg->im_dst.s_addr) ||
+	    nla_put_u32(skb, IPMRA_CREPORT_TABLE, mrt->id))
 		goto nla_put_failure;
 
 	nla = nla_reserve(skb, IPMRA_CREPORT_PKT, payloadlen);
@@ -3001,7 +3003,6 @@ static const struct seq_operations ipmr_mfc_seq_ops = {
 #ifdef CONFIG_IP_PIMSM_V2
 static const struct net_protocol pim_protocol = {
 	.handler	=	pim_rcv,
-	.netns_ok	=	1,
 };
 #endif
 

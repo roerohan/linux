@@ -20,8 +20,8 @@ A. Configuration
 ================
 
 The framebuffer console can be enabled by using your favorite kernel
-configuration tool.  It is under Device Drivers->Graphics Support->Frame
-buffer Devices->Console display driver support->Framebuffer Console Support.
+configuration tool.  It is under Device Drivers->Graphics Support->
+Console display driver support->Framebuffer Console Support.
 Select 'y' to compile support statically or 'm' for module support.  The
 module will be fbcon.
 
@@ -81,7 +81,7 @@ C. Boot options
 1. fbcon=font:<name>
 
 	Select the initial font to use. The value 'name' can be any of the
-	compiled-in fonts: 10x18, 6x10, 7x14, Acorn8x8, MINI4x6,
+	compiled-in fonts: 10x18, 6x10, 6x8, 7x14, Acorn8x8, MINI4x6,
 	PEARL8x8, ProFont6x11, SUN12x22, SUN8x16, TER16x32, VGA8x16, VGA8x8.
 
 	Note, not all drivers can handle font with widths not divisible by 8,
@@ -207,9 +207,9 @@ Documentation/driver-api/console.rst. To summarize:
 Echo a value to the bind file that represents the framebuffer console
 driver. So assuming vtcon1 represents fbcon, then::
 
-  echo 1 > sys/class/vtconsole/vtcon1/bind - attach framebuffer console to
+  echo 1 > /sys/class/vtconsole/vtcon1/bind - attach framebuffer console to
 					     console layer
-  echo 0 > sys/class/vtconsole/vtcon1/bind - detach framebuffer console from
+  echo 0 > /sys/class/vtconsole/vtcon1/bind - detach framebuffer console from
 					     console layer
 
 If fbcon is detached from the console layer, your boot console driver (which is

@@ -206,7 +206,9 @@ static int wuxga_nt_panel_add(struct wuxga_nt_panel *wuxga_nt)
 	if (ret)
 		return ret;
 
-	return drm_panel_add(&wuxga_nt->base);
+	drm_panel_add(&wuxga_nt->base);
+
+	return 0;
 }
 
 static void wuxga_nt_panel_del(struct wuxga_nt_panel *wuxga_nt)
@@ -239,7 +241,13 @@ static int wuxga_nt_panel_probe(struct mipi_dsi_device *dsi)
 	if (ret < 0)
 		return ret;
 
-	return mipi_dsi_attach(dsi);
+	ret = mipi_dsi_attach(dsi);
+	if (ret < 0) {
+		wuxga_nt_panel_del(wuxga_nt);
+		return ret;
+	}
+
+	return 0;
 }
 
 static int wuxga_nt_panel_remove(struct mipi_dsi_device *dsi)

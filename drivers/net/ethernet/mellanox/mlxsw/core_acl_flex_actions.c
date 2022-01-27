@@ -113,7 +113,7 @@ static const struct rhashtable_params mlxsw_afa_set_ht_params = {
 };
 
 struct mlxsw_afa_fwd_entry_ht_key {
-	u8 local_port;
+	u16 local_port;
 };
 
 struct mlxsw_afa_fwd_entry {
@@ -555,7 +555,7 @@ int mlxsw_afa_block_terminate(struct mlxsw_afa_block *block)
 EXPORT_SYMBOL(mlxsw_afa_block_terminate);
 
 static struct mlxsw_afa_fwd_entry *
-mlxsw_afa_fwd_entry_create(struct mlxsw_afa *mlxsw_afa, u8 local_port)
+mlxsw_afa_fwd_entry_create(struct mlxsw_afa *mlxsw_afa, u16 local_port)
 {
 	struct mlxsw_afa_fwd_entry *fwd_entry;
 	int err;
@@ -598,7 +598,7 @@ static void mlxsw_afa_fwd_entry_destroy(struct mlxsw_afa *mlxsw_afa,
 }
 
 static struct mlxsw_afa_fwd_entry *
-mlxsw_afa_fwd_entry_get(struct mlxsw_afa *mlxsw_afa, u8 local_port)
+mlxsw_afa_fwd_entry_get(struct mlxsw_afa *mlxsw_afa, u16 local_port)
 {
 	struct mlxsw_afa_fwd_entry_ht_key ht_key = {0};
 	struct mlxsw_afa_fwd_entry *fwd_entry;
@@ -647,7 +647,7 @@ mlxsw_afa_fwd_entry_ref_destructor(struct mlxsw_afa_block *block,
 }
 
 static struct mlxsw_afa_fwd_entry_ref *
-mlxsw_afa_fwd_entry_ref_create(struct mlxsw_afa_block *block, u8 local_port)
+mlxsw_afa_fwd_entry_ref_create(struct mlxsw_afa_block *block, u16 local_port)
 {
 	struct mlxsw_afa_fwd_entry_ref *fwd_entry_ref;
 	struct mlxsw_afa_fwd_entry *fwd_entry;
@@ -1352,7 +1352,7 @@ EXPORT_SYMBOL(mlxsw_afa_block_append_trap_and_forward);
 struct mlxsw_afa_mirror {
 	struct mlxsw_afa_resource resource;
 	int span_id;
-	u8 local_in_port;
+	u16 local_in_port;
 	bool ingress;
 };
 
@@ -1379,7 +1379,7 @@ mlxsw_afa_mirror_destructor(struct mlxsw_afa_block *block,
 }
 
 static struct mlxsw_afa_mirror *
-mlxsw_afa_mirror_create(struct mlxsw_afa_block *block, u8 local_in_port,
+mlxsw_afa_mirror_create(struct mlxsw_afa_block *block, u16 local_in_port,
 			const struct net_device *out_dev, bool ingress)
 {
 	struct mlxsw_afa_mirror *mirror;
@@ -1423,7 +1423,7 @@ mlxsw_afa_block_append_allocated_mirror(struct mlxsw_afa_block *block,
 }
 
 int
-mlxsw_afa_block_append_mirror(struct mlxsw_afa_block *block, u8 local_in_port,
+mlxsw_afa_block_append_mirror(struct mlxsw_afa_block *block, u16 local_in_port,
 			      const struct net_device *out_dev, bool ingress,
 			      struct netlink_ext_ack *extack)
 {
@@ -1663,7 +1663,7 @@ mlxsw_afa_forward_pack(char *payload, enum mlxsw_afa_forward_type type,
 }
 
 int mlxsw_afa_block_append_fwd(struct mlxsw_afa_block *block,
-			       u8 local_port, bool in_port,
+			       u16 local_port, bool in_port,
 			       struct netlink_ext_ack *extack)
 {
 	struct mlxsw_afa_fwd_entry_ref *fwd_entry_ref;
@@ -2007,3 +2007,134 @@ int mlxsw_afa_block_append_l4port(struct mlxsw_afa_block *block, bool is_dport, 
 	return 0;
 }
 EXPORT_SYMBOL(mlxsw_afa_block_append_l4port);
+
+/* Mirror Sampler Action
+ * ---------------------
+ * The SAMPLER_ACTION is used to mirror packets with a probability (sampling).
+ */
+
+#define MLXSW_AFA_SAMPLER_CODE 0x13
+#define MLXSW_AFA_SAMPLER_SIZE 1
+
+/* afa_sampler_mirror_agent
+ * Mirror (SPAN) agent.
+ */
+MLXSW_ITEM32(afa, sampler, mirror_agent, 0x04, 0, 3);
+
+#define MLXSW_AFA_SAMPLER_RATE_MAX (BIT(24) - 1)
+
+/* afa_sampler_mirror_probability_rate
+ * Mirroring probability.
+ * Valid values are 1 to 2^24 - 1
+ */
+MLXSW_ITEM32(afa, sampler, mirror_probability_rate, 0x08, 0, 24);
+
+static void mlxsw_afa_sampler_pack(char *payload, u8 mirror_agent, u32 rate)
+{
+	mlxsw_afa_sampler_mirror_agent_set(payload, mirror_agent);
+	mlxsw_afa_sampler_mirror_probability_rate_set(payload, rate);
+}
+
+struct mlxsw_afa_sampler {
+	struct mlxsw_afa_resource resource;
+	int span_id;
+	u16 local_port;
+	bool ingress;
+};
+
+static void mlxsw_afa_sampler_destroy(struct mlxsw_afa_block *block,
+				      struct mlxsw_afa_sampler *sampler)
+{
+	mlxsw_afa_resource_del(&sampler->resource);
+	block->afa->ops->sampler_del(block->afa->ops_priv, sampler->local_port,
+				     sampler->span_id, sampler->ingress);
+	kfree(sampler);
+}
+
+static void mlxsw_afa_sampler_destructor(struct mlxsw_afa_block *block,
+					 struct mlxsw_afa_resource *resource)
+{
+	struct mlxsw_afa_sampler *sampler;
+
+	sampler = container_of(resource, struct mlxsw_afa_sampler, resource);
+	mlxsw_afa_sampler_destroy(block, sampler);
+}
+
+static struct mlxsw_afa_sampler *
+mlxsw_afa_sampler_create(struct mlxsw_afa_block *block, u16 local_port,
+			 struct psample_group *psample_group, u32 rate,
+			 u32 trunc_size, bool truncate, bool ingress,
+			 struct netlink_ext_ack *extack)
+{
+	struct mlxsw_afa_sampler *sampler;
+	int err;
+
+	sampler = kzalloc(sizeof(*sampler), GFP_KERNEL);
+	if (!sampler)
+		return ERR_PTR(-ENOMEM);
+
+	err = block->afa->ops->sampler_add(block->afa->ops_priv, local_port,
+					   psample_group, rate, trunc_size,
+					   truncate, ingress, &sampler->span_id,
+					   extack);
+	if (err)
+		goto err_sampler_add;
+
+	sampler->ingress = ingress;
+	sampler->local_port = local_port;
+	sampler->resource.destructor = mlxsw_afa_sampler_destructor;
+	mlxsw_afa_resource_add(block, &sampler->resource);
+	return sampler;
+
+err_sampler_add:
+	kfree(sampler);
+	return ERR_PTR(err);
+}
+
+static int
+mlxsw_afa_block_append_allocated_sampler(struct mlxsw_afa_block *block,
+					 u8 mirror_agent, u32 rate)
+{
+	char *act = mlxsw_afa_block_append_action(block, MLXSW_AFA_SAMPLER_CODE,
+						  MLXSW_AFA_SAMPLER_SIZE);
+
+	if (IS_ERR(act))
+		return PTR_ERR(act);
+	mlxsw_afa_sampler_pack(act, mirror_agent, rate);
+	return 0;
+}
+
+int mlxsw_afa_block_append_sampler(struct mlxsw_afa_block *block, u16 local_port,
+				   struct psample_group *psample_group,
+				   u32 rate, u32 trunc_size, bool truncate,
+				   bool ingress,
+				   struct netlink_ext_ack *extack)
+{
+	struct mlxsw_afa_sampler *sampler;
+	int err;
+
+	if (rate > MLXSW_AFA_SAMPLER_RATE_MAX) {
+		NL_SET_ERR_MSG_MOD(extack, "Sampling rate is too high");
+		return -EINVAL;
+	}
+
+	sampler = mlxsw_afa_sampler_create(block, local_port, psample_group,
+					   rate, trunc_size, truncate, ingress,
+					   extack);
+	if (IS_ERR(sampler))
+		return PTR_ERR(sampler);
+
+	err = mlxsw_afa_block_append_allocated_sampler(block, sampler->span_id,
+						       rate);
+	if (err) {
+		NL_SET_ERR_MSG_MOD(extack, "Cannot append sampler action");
+		goto err_append_allocated_sampler;
+	}
+
+	return 0;
+
+err_append_allocated_sampler:
+	mlxsw_afa_sampler_destroy(block, sampler);
+	return err;
+}
+EXPORT_SYMBOL(mlxsw_afa_block_append_sampler);

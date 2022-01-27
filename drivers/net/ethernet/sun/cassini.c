@@ -454,8 +454,8 @@ static int cas_page_free(struct cas *cp, cas_page_t *page)
 #define RX_USED_ADD(x, y)       ((x)->used += (y))
 #define RX_USED_SET(x, y)       ((x)->used  = (y))
 #else
-#define RX_USED_ADD(x, y)
-#define RX_USED_SET(x, y)
+#define RX_USED_ADD(x, y) do { } while(0)
+#define RX_USED_SET(x, y) do { } while(0)
 #endif
 
 /* local page allocation routines for the receive buffers. jumbo pages
@@ -486,7 +486,7 @@ page_err:
 /* initialize spare pool of rx buffers, but allocate during the open */
 static void cas_spare_init(struct cas *cp)
 {
-  	spin_lock(&cp->rx_inuse_lock);
+	spin_lock(&cp->rx_inuse_lock);
 	INIT_LIST_HEAD(&cp->rx_inuse_list);
 	spin_unlock(&cp->rx_inuse_lock);
 
@@ -1599,6 +1599,7 @@ static inline int cas_mdio_link_not_up(struct cas *cp)
 			cas_phy_write(cp, MII_BMCR, val);
 			break;
 		}
+		break;
 	default:
 		break;
 	}
@@ -3026,7 +3027,7 @@ static void cas_mac_reset(struct cas *cp)
 /* Must be invoked under cp->lock. */
 static void cas_init_mac(struct cas *cp)
 {
-	unsigned char *e = &cp->dev->dev_addr[0];
+	const unsigned char *e = &cp->dev->dev_addr[0];
 	int i;
 	cas_mac_reset(cp);
 
@@ -3378,6 +3379,7 @@ static void cas_check_pci_invariants(struct cas *cp)
 static int cas_check_invariants(struct cas *cp)
 {
 	struct pci_dev *pdev = cp->pdev;
+	u8 addr[ETH_ALEN];
 	u32 cfg;
 	int i;
 
@@ -3406,8 +3408,8 @@ static int cas_check_invariants(struct cas *cp)
 	/* finish phy determination. MDIO1 takes precedence over MDIO0 if
 	 * they're both connected.
 	 */
-	cp->phy_type = cas_get_vpd_info(cp, cp->dev->dev_addr,
-					PCI_SLOT(pdev->devfn));
+	cp->phy_type = cas_get_vpd_info(cp, addr, PCI_SLOT(pdev->devfn));
+	eth_hw_addr_set(cp->dev, addr);
 	if (cp->phy_type & CAS_PHY_SERDES) {
 		cp->cas_flags |= CAS_FLAG_1000MB_CAP;
 		return 0; /* no more checking needed */
@@ -4875,7 +4877,7 @@ static const struct net_device_ops cas_netdev_ops = {
 	.ndo_start_xmit		= cas_start_xmit,
 	.ndo_get_stats 		= cas_get_stats,
 	.ndo_set_rx_mode	= cas_set_multicast,
-	.ndo_do_ioctl		= cas_ioctl,
+	.ndo_eth_ioctl		= cas_ioctl,
 	.ndo_tx_timeout		= cas_tx_timeout,
 	.ndo_change_mtu		= cas_change_mtu,
 	.ndo_set_mac_address	= eth_mac_addr,
@@ -4891,8 +4893,8 @@ static int cas_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	unsigned long casreg_len;
 	struct net_device *dev;
 	struct cas *cp;
-	int i, err, pci_using_dac;
 	u16 pci_cmd;
+	int i, err;
 	u8 orig_cacheline_size = 0, cas_cacheline_size = 0;
 
 	if (cas_version_printed++ == 0)
@@ -4963,23 +4965,10 @@ static int cas_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 
 	/* Configure DMA attributes. */
-	if (!dma_set_mask(&pdev->dev, DMA_BIT_MASK(64))) {
-		pci_using_dac = 1;
-		err = dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(64));
-		if (err < 0) {
-			dev_err(&pdev->dev, "Unable to obtain 64-bit DMA "
-			       "for consistent allocations\n");
-			goto err_out_free_res;
-		}
-
-	} else {
-		err = dma_set_mask(&pdev->dev, DMA_BIT_MASK(32));
-		if (err) {
-			dev_err(&pdev->dev, "No usable DMA configuration, "
-			       "aborting\n");
-			goto err_out_free_res;
-		}
-		pci_using_dac = 0;
+	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+	if (err) {
+		dev_err(&pdev->dev, "No usable DMA configuration, aborting\n");
+		goto err_out_free_res;
 	}
 
 	casreg_len = pci_resource_len(pdev, 0);
@@ -5085,8 +5074,7 @@ static int cas_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	if ((cp->cas_flags & CAS_FLAG_NO_HW_CSUM) == 0)
 		dev->features |= NETIF_F_HW_CSUM | NETIF_F_SG;
 
-	if (pci_using_dac)
-		dev->features |= NETIF_F_HIGHDMA;
+	dev->features |= NETIF_F_HIGHDMA;
 
 	/* MTU range: 60 - varies or 9000 */
 	dev->min_mtu = CAS_MIN_MTU;

@@ -134,6 +134,9 @@ int spectre_v2_test(void)
 	s64 miss_percent;
 	bool is_p9;
 
+	// The PMU events we use only work on Power8 or later
+	SKIP_IF(!have_hwcap2(PPC_FEATURE2_ARCH_2_07));
+
 	state = get_sysfs_state();
 	if (state == UNKNOWN) {
 		printf("Error: couldn't determine spectre_v2 mitigation state?\n");
@@ -190,7 +193,7 @@ int spectre_v2_test(void)
 			 * We are not vulnerable and reporting otherwise, so
 			 * missing such a mismatch is safe.
 			 */
-			if (state == VULNERABLE)
+			if (miss_percent > 95)
 				return 4;
 
 			return 1;

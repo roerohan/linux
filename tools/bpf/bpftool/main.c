@@ -10,6 +10,8 @@
 #include <string.h>
 
 #include <bpf/bpf.h>
+#include <bpf/btf.h>
+#include <bpf/hashmap.h>
 #include <bpf/libbpf.h>
 
 #include "main.h"
@@ -28,10 +30,10 @@ bool show_pinned;
 bool block_mount;
 bool verifier_logs;
 bool relaxed_maps;
-struct pinned_obj_table prog_table;
-struct pinned_obj_table map_table;
-struct pinned_obj_table link_table;
-struct obj_refs_table refs_table;
+bool use_loader;
+bool legacy_libbpf;
+struct btf *base_btf;
+struct hashmap *refs_table;
 
 static void __noreturn clean_and_exit(int i)
 {
@@ -61,7 +63,8 @@ static int do_help(int argc, char **argv)
 		"       %s version\n"
 		"\n"
 		"       OBJECT := { prog | map | link | cgroup | perf | net | feature | btf | gen | struct_ops | iter }\n"
-		"       " HELP_SPEC_OPTIONS "\n"
+		"       " HELP_SPEC_OPTIONS " |\n"
+		"                    {-V|--version} }\n"
 		"",
 		bin_name, bin_name, bin_name);
 
@@ -70,13 +73,47 @@ static int do_help(int argc, char **argv)
 
 static int do_version(int argc, char **argv)
 {
+#ifdef HAVE_LIBBFD_SUPPORT
+	const bool has_libbfd = true;
+#else
+	const bool has_libbfd = false;
+#endif
+#ifdef BPFTOOL_WITHOUT_SKELETONS
+	const bool has_skeletons = false;
+#else
+	const bool has_skeletons = true;
+#endif
+
 	if (json_output) {
-		jsonw_start_object(json_wtr);
+		jsonw_start_object(json_wtr);	/* root object */
+
 		jsonw_name(json_wtr, "version");
 		jsonw_printf(json_wtr, "\"%s\"", BPFTOOL_VERSION);
-		jsonw_end_object(json_wtr);
+
+		jsonw_name(json_wtr, "features");
+		jsonw_start_object(json_wtr);	/* features */
+		jsonw_bool_field(json_wtr, "libbfd", has_libbfd);
+		jsonw_bool_field(json_wtr, "libbpf_strict", !legacy_libbpf);
+		jsonw_bool_field(json_wtr, "skeletons", has_skeletons);
+		jsonw_end_object(json_wtr);	/* features */
+
+		jsonw_end_object(json_wtr);	/* root object */
 	} else {
+		unsigned int nb_features = 0;
+
 		printf("%s v%s\n", bin_name, BPFTOOL_VERSION);
+		printf("features:");
+		if (has_libbfd) {
+			printf(" libbfd");
+			nb_features++;
+		}
+		if (!legacy_libbpf) {
+			printf("%s libbpf_strict", nb_features++ ? "," : "");
+			nb_features++;
+		}
+		if (has_skeletons)
+			printf("%s skeletons", nb_features++ ? "," : "");
+		printf("\n");
 	}
 	return 0;
 }
@@ -245,7 +282,7 @@ static int do_batch(int argc, char **argv)
 	int n_argc;
 	FILE *fp;
 	char *cp;
-	int err;
+	int err = 0;
 	int i;
 
 	if (argc < 2) {
@@ -309,8 +346,10 @@ static int do_batch(int argc, char **argv)
 		n_argc = make_args(buf, n_argv, BATCH_ARG_NB_MAX, lines);
 		if (!n_argc)
 			continue;
-		if (n_argc < 0)
+		if (n_argc < 0) {
+			err = n_argc;
 			goto err_close;
+		}
 
 		if (json_output) {
 			jsonw_start_object(json_wtr);
@@ -339,7 +378,6 @@ static int do_batch(int argc, char **argv)
 	} else {
 		if (!json_output)
 			printf("processed %d commands\n", lines);
-		err = 0;
 	}
 err_close:
 	if (fp != stdin)
@@ -362,9 +400,15 @@ int main(int argc, char **argv)
 		{ "mapcompat",	no_argument,	NULL,	'm' },
 		{ "nomount",	no_argument,	NULL,	'n' },
 		{ "debug",	no_argument,	NULL,	'd' },
+		{ "use-loader",	no_argument,	NULL,	'L' },
+		{ "base-btf",	required_argument, NULL, 'B' },
+		{ "legacy",	no_argument,	NULL,	'l' },
 		{ 0 }
 	};
+	bool version_requested = false;
 	int opt, ret;
+
+	setlinebuf(stdout);
 
 	last_do_help = do_help;
 	pretty_output = false;
@@ -373,16 +417,13 @@ int main(int argc, char **argv)
 	block_mount = false;
 	bin_name = argv[0];
 
-	hash_init(prog_table.table);
-	hash_init(map_table.table);
-	hash_init(link_table.table);
-
 	opterr = 0;
-	while ((opt = getopt_long(argc, argv, "Vhpjfmnd",
+	while ((opt = getopt_long(argc, argv, "VhpjfLmndB:l",
 				  options, NULL)) >= 0) {
 		switch (opt) {
 		case 'V':
-			return do_version(argc, argv);
+			version_requested = true;
+			break;
 		case 'h':
 			return do_help(argc, argv);
 		case 'p':
@@ -412,6 +453,21 @@ int main(int argc, char **argv)
 			libbpf_set_print(print_all_levels);
 			verifier_logs = true;
 			break;
+		case 'B':
+			base_btf = btf__parse(optarg, NULL);
+			if (libbpf_get_error(base_btf)) {
+				p_err("failed to parse base BTF at '%s': %ld\n",
+				      optarg, libbpf_get_error(base_btf));
+				base_btf = NULL;
+				return -1;
+			}
+			break;
+		case 'L':
+			use_loader = true;
+			break;
+		case 'l':
+			legacy_libbpf = true;
+			break;
 		default:
 			p_err("unrecognized option '%s'", argv[optind - 1]);
 			if (json_output)
@@ -421,21 +477,26 @@ int main(int argc, char **argv)
 		}
 	}
 
+	if (!legacy_libbpf) {
+		ret = libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
+		if (ret)
+			p_err("failed to enable libbpf strict mode: %d", ret);
+	}
+
 	argc -= optind;
 	argv += optind;
 	if (argc < 0)
 		usage();
+
+	if (version_requested)
+		return do_version(argc, argv);
 
 	ret = cmd_select(cmds, argc, argv, do_help);
 
 	if (json_output)
 		jsonw_destroy(&json_wtr);
 
-	if (show_pinned) {
-		delete_pinned_obj_table(&prog_table);
-		delete_pinned_obj_table(&map_table);
-		delete_pinned_obj_table(&link_table);
-	}
+	btf__free(base_btf);
 
 	return ret;
 }

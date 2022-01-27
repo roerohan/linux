@@ -57,7 +57,8 @@ __be32          nfsd4_set_nfs4_label(struct svc_rqst *, struct svc_fh *,
 		    struct xdr_netobj *);
 __be32		nfsd4_vfs_fallocate(struct svc_rqst *, struct svc_fh *,
 				    struct file *, loff_t, loff_t, int);
-__be32		nfsd4_clone_file_range(struct nfsd_file *nf_src, u64 src_pos,
+__be32		nfsd4_clone_file_range(struct svc_rqst *rqstp,
+				       struct nfsd_file *nf_src, u64 src_pos,
 				       struct nfsd_file *nf_dst, u64 dst_pos,
 				       u64 count, bool sync);
 #endif /* CONFIG_NFSD_V4 */
@@ -152,7 +153,7 @@ static inline void fh_drop_write(struct svc_fh *fh)
 	}
 }
 
-static inline __be32 fh_getattr(struct svc_fh *fh, struct kstat *stat)
+static inline __be32 fh_getattr(const struct svc_fh *fh, struct kstat *stat)
 {
 	struct path p = {.mnt = fh->fh_export->ex_path.mnt,
 			 .dentry = fh->fh_dentry};

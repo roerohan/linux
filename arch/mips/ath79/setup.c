@@ -34,15 +34,6 @@
 
 static char ath79_sys_type[ATH79_SYS_TYPE_LEN];
 
-static void ath79_restart(char *command)
-{
-	local_irq_disable();
-	ath79_device_reset_set(AR71XX_RESET_FULL_CHIP);
-	for (;;)
-		if (cpu_wait)
-			cpu_wait();
-}
-
 static void ath79_halt(void)
 {
 	while (1)
@@ -213,16 +204,17 @@ unsigned int get_c0_compare_int(void)
 
 void __init plat_mem_setup(void)
 {
-	unsigned long fdt_start;
+	void *dtb;
 
 	set_io_port_base(KSEG1);
 
 	/* Get the position of the FDT passed by the bootloader */
-	fdt_start = fw_getenvl("fdt_start");
-	if (fdt_start)
-		__dt_setup_arch((void *)KSEG0ADDR(fdt_start));
-	else if (fw_passed_dtb)
-		__dt_setup_arch((void *)KSEG0ADDR(fw_passed_dtb));
+	dtb = (void *)fw_getenvl("fdt_start");
+	if (dtb == NULL)
+		dtb = get_fdt();
+
+	if (dtb)
+		__dt_setup_arch((void *)KSEG0ADDR(dtb));
 
 	ath79_reset_base = ioremap(AR71XX_RESET_BASE,
 					   AR71XX_RESET_SIZE);
@@ -233,7 +225,6 @@ void __init plat_mem_setup(void)
 
 	detect_memory_region(0, ATH79_MEM_SIZE_MIN, ATH79_MEM_SIZE_MAX);
 
-	_machine_restart = ath79_restart;
 	_machine_halt = ath79_halt;
 	pm_power_off = ath79_halt;
 }

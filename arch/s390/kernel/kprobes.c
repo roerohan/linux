@@ -7,6 +7,9 @@
  * s390 port, used ppc64 as template. Mike Grundy <grundym@us.ibm.com>
  */
 
+#define pr_fmt(fmt) "kprobes: " fmt
+
+#include <linux/moduleloader.h>
 #include <linux/kprobes.h>
 #include <linux/ptrace.h>
 #include <linux/preempt.h>
@@ -21,6 +24,7 @@
 #include <asm/set_memory.h>
 #include <asm/sections.h>
 #include <asm/dis.h>
+#include "entry.h"
 
 DEFINE_PER_CPU(struct kprobe *, current_kprobe);
 DEFINE_PER_CPU(struct kprobe_ctlblk, kprobe_ctlblk);
@@ -30,19 +34,27 @@ struct kretprobe_blackpoint kretprobe_blacklist[] = { };
 DEFINE_INSN_CACHE_OPS(s390_insn);
 
 static int insn_page_in_use;
-static char insn_page[PAGE_SIZE] __aligned(PAGE_SIZE);
+
+void *alloc_insn_page(void)
+{
+	void *page;
+
+	page = module_alloc(PAGE_SIZE);
+	if (!page)
+		return NULL;
+	__set_memory((unsigned long) page, 1, SET_MEMORY_RO | SET_MEMORY_X);
+	return page;
+}
 
 static void *alloc_s390_insn_page(void)
 {
 	if (xchg(&insn_page_in_use, 1) == 1)
 		return NULL;
-	set_memory_x((unsigned long) &insn_page, 1);
-	return &insn_page;
+	return &kprobes_insn_page;
 }
 
 static void free_s390_insn_page(void *page)
 {
-	set_memory_nx((unsigned long) page, 1);
 	xchg(&insn_page_in_use, 0);
 }
 
@@ -56,32 +68,31 @@ struct kprobe_insn_cache kprobe_s390_insn_slots = {
 
 static void copy_instruction(struct kprobe *p)
 {
+	kprobe_opcode_t insn[MAX_INSN_SIZE];
 	s64 disp, new_disp;
 	u64 addr, new_addr;
+	unsigned int len;
 
-	memcpy(p->ainsn.insn, p->addr, insn_length(*p->addr >> 8));
-	p->opcode = p->ainsn.insn[0];
-	if (!probe_is_insn_relative_long(p->ainsn.insn))
-		return;
-	/*
-	 * For pc-relative instructions in RIL-b or RIL-c format patch the
-	 * RI2 displacement field. We have already made sure that the insn
-	 * slot for the patched instruction is within the same 2GB area
-	 * as the original instruction (either kernel image or module area).
-	 * Therefore the new displacement will always fit.
-	 */
-	disp = *(s32 *)&p->ainsn.insn[1];
-	addr = (u64)(unsigned long)p->addr;
-	new_addr = (u64)(unsigned long)p->ainsn.insn;
-	new_disp = ((addr + (disp * 2)) - new_addr) / 2;
-	*(s32 *)&p->ainsn.insn[1] = new_disp;
+	len = insn_length(*p->addr >> 8);
+	memcpy(&insn, p->addr, len);
+	p->opcode = insn[0];
+	if (probe_is_insn_relative_long(&insn[0])) {
+		/*
+		 * For pc-relative instructions in RIL-b or RIL-c format patch
+		 * the RI2 displacement field. We have already made sure that
+		 * the insn slot for the patched instruction is within the same
+		 * 2GB area as the original instruction (either kernel image or
+		 * module area). Therefore the new displacement will always fit.
+		 */
+		disp = *(s32 *)&insn[1];
+		addr = (u64)(unsigned long)p->addr;
+		new_addr = (u64)(unsigned long)p->ainsn.insn;
+		new_disp = ((addr + (disp * 2)) - new_addr) / 2;
+		*(s32 *)&insn[1] = new_disp;
+	}
+	s390_kernel_write(p->ainsn.insn, &insn, len);
 }
 NOKPROBE_SYMBOL(copy_instruction);
-
-static inline int is_kernel_addr(void *addr)
-{
-	return addr < (void *)_end;
-}
 
 static int s390_get_insn_slot(struct kprobe *p)
 {
@@ -91,7 +102,7 @@ static int s390_get_insn_slot(struct kprobe *p)
 	 * field can be patched and executed within the insn slot.
 	 */
 	p->ainsn.insn = NULL;
-	if (is_kernel_addr(p->addr))
+	if (is_kernel((unsigned long)p->addr))
 		p->ainsn.insn = get_s390_insn_slot();
 	else if (is_module_addr(p->addr))
 		p->ainsn.insn = get_insn_slot();
@@ -103,7 +114,7 @@ static void s390_free_insn_slot(struct kprobe *p)
 {
 	if (!p->ainsn.insn)
 		return;
-	if (is_kernel_addr(p->addr))
+	if (is_kernel((unsigned long)p->addr))
 		free_s390_insn_slot(p->ainsn.insn, 0);
 	else
 		free_insn_slot(p->ainsn.insn, 0);
@@ -111,9 +122,55 @@ static void s390_free_insn_slot(struct kprobe *p)
 }
 NOKPROBE_SYMBOL(s390_free_insn_slot);
 
+/* Check if paddr is at an instruction boundary */
+static bool can_probe(unsigned long paddr)
+{
+	unsigned long addr, offset = 0;
+	kprobe_opcode_t insn;
+	struct kprobe *kp;
+
+	if (paddr & 0x01)
+		return false;
+
+	if (!kallsyms_lookup_size_offset(paddr, NULL, &offset))
+		return false;
+
+	/* Decode instructions */
+	addr = paddr - offset;
+	while (addr < paddr) {
+		if (copy_from_kernel_nofault(&insn, (void *)addr, sizeof(insn)))
+			return false;
+
+		if (insn >> 8 == 0) {
+			if (insn != BREAKPOINT_INSTRUCTION) {
+				/*
+				 * Note that QEMU inserts opcode 0x0000 to implement
+				 * software breakpoints for guests. Since the size of
+				 * the original instruction is unknown, stop following
+				 * instructions and prevent setting a kprobe.
+				 */
+				return false;
+			}
+			/*
+			 * Check if the instruction has been modified by another
+			 * kprobe, in which case the original instruction is
+			 * decoded.
+			 */
+			kp = get_kprobe((void *)addr);
+			if (!kp) {
+				/* not a kprobe */
+				return false;
+			}
+			insn = kp->opcode;
+		}
+		addr += insn_length(insn >> 8);
+	}
+	return addr == paddr;
+}
+
 int arch_prepare_kprobe(struct kprobe *p)
 {
-	if ((unsigned long) p->addr & 0x01)
+	if (!can_probe((unsigned long)p->addr))
 		return -EINVAL;
 	/* Make sure the probe isn't going on a difficult instruction */
 	if (probe_is_prohibited_opcode(p->addr))
@@ -231,7 +288,7 @@ void arch_prepare_kretprobe(struct kretprobe_instance *ri, struct pt_regs *regs)
 	ri->fp = NULL;
 
 	/* Replace the return addr with trampoline addr */
-	regs->gprs[14] = (unsigned long) &kretprobe_trampoline;
+	regs->gprs[14] = (unsigned long) &__kretprobe_trampoline;
 }
 NOKPROBE_SYMBOL(arch_prepare_kretprobe);
 
@@ -250,7 +307,7 @@ static void kprobe_reenter_check(struct kprobe_ctlblk *kcb, struct kprobe *p)
 		 * is a BUG. The code path resides in the .kprobes.text
 		 * section and is executed with interrupts disabled.
 		 */
-		pr_err("Invalid kprobe detected.\n");
+		pr_err("Failed to recover from reentered kprobes.\n");
 		dump_kprobe(p);
 		BUG();
 	}
@@ -323,8 +380,8 @@ NOKPROBE_SYMBOL(kprobe_handler);
  */
 static void __used kretprobe_trampoline_holder(void)
 {
-	asm volatile(".global kretprobe_trampoline\n"
-		     "kretprobe_trampoline: bcr 0,0\n");
+	asm volatile(".global __kretprobe_trampoline\n"
+		     "__kretprobe_trampoline: bcr 0,0\n");
 }
 
 /*
@@ -332,7 +389,7 @@ static void __used kretprobe_trampoline_holder(void)
  */
 static int trampoline_probe_handler(struct kprobe *p, struct pt_regs *regs)
 {
-	regs->psw.addr = __kretprobe_trampoline_handler(regs, &kretprobe_trampoline, NULL);
+	regs->psw.addr = __kretprobe_trampoline_handler(regs, NULL);
 	/*
 	 * By returning a non-zero value, we are telling
 	 * kprobe_handler() that we don't want the post_handler
@@ -427,23 +484,6 @@ static int kprobe_trap_handler(struct pt_regs *regs, int trapnr)
 	case KPROBE_HIT_ACTIVE:
 	case KPROBE_HIT_SSDONE:
 		/*
-		 * We increment the nmissed count for accounting,
-		 * we can also use npre/npostfault count for accounting
-		 * these specific fault cases.
-		 */
-		kprobes_inc_nmissed_count(p);
-
-		/*
-		 * We come here because instructions in the pre/post
-		 * handler caused the page_fault, this could happen
-		 * if handler tries to access user space by
-		 * copy_from_user(), get_user() etc. Let the
-		 * user-specified handler try to fix it first.
-		 */
-		if (p->fault_handler && p->fault_handler(p, regs, trapnr))
-			return 1;
-
-		/*
 		 * In case the user-specified fault handler returned
 		 * zero, try to fix up.
 		 */
@@ -515,7 +555,7 @@ int kprobe_exceptions_notify(struct notifier_block *self,
 NOKPROBE_SYMBOL(kprobe_exceptions_notify);
 
 static struct kprobe trampoline = {
-	.addr = (kprobe_opcode_t *) &kretprobe_trampoline,
+	.addr = (kprobe_opcode_t *) &__kretprobe_trampoline,
 	.pre_handler = trampoline_probe_handler
 };
 
@@ -526,6 +566,6 @@ int __init arch_init_kprobes(void)
 
 int arch_trampoline_kprobe(struct kprobe *p)
 {
-	return p->addr == (kprobe_opcode_t *) &kretprobe_trampoline;
+	return p->addr == (kprobe_opcode_t *) &__kretprobe_trampoline;
 }
 NOKPROBE_SYMBOL(arch_trampoline_kprobe);

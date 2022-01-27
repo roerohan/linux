@@ -157,10 +157,8 @@ static int setup_rt_frame(struct ksignal *ksig, sigset_t *set,
 	struct rt_sigframe __user *frame;
 	int err = 0, sig = ksig->sig;
 	unsigned long address = 0;
-#ifdef CONFIG_MMU
 	pmd_t *pmdp;
 	pte_t *ptep;
-#endif
 
 	frame = get_sigframe(ksig, regs, sizeof(*frame));
 
@@ -192,7 +190,6 @@ static int setup_rt_frame(struct ksignal *ksig, sigset_t *set,
 	regs->r15 = ((unsigned long)frame->tramp)-8;
 
 	address = ((unsigned long)frame->tramp);
-#ifdef CONFIG_MMU
 	pmdp = pmd_off(current->mm, address);
 
 	preempt_disable();
@@ -208,10 +205,6 @@ static int setup_rt_frame(struct ksignal *ksig, sigset_t *set,
 	}
 	pte_unmap(ptep);
 	preempt_enable();
-#else
-	flush_icache_range(address, address + 8);
-	flush_dcache_range(address, address + 8);
-#endif
 	if (err)
 		return -EFAULT;
 
@@ -290,7 +283,7 @@ static void do_signal(struct pt_regs *regs, int in_syscall)
 #ifdef DEBUG_SIG
 	pr_info("do signal: %p %d\n", regs, in_syscall);
 	pr_info("do signal2: %lx %lx %ld [%lx]\n", regs->pc, regs->r1,
-			regs->r12, current_thread_info()->flags);
+			regs->r12, read_thread_flags());
 #endif
 
 	if (get_signal(&ksig)) {
@@ -313,9 +306,10 @@ static void do_signal(struct pt_regs *regs, int in_syscall)
 
 asmlinkage void do_notify_resume(struct pt_regs *regs, int in_syscall)
 {
-	if (test_thread_flag(TIF_SIGPENDING))
+	if (test_thread_flag(TIF_SIGPENDING) ||
+	    test_thread_flag(TIF_NOTIFY_SIGNAL))
 		do_signal(regs, in_syscall);
 
-	if (test_and_clear_thread_flag(TIF_NOTIFY_RESUME))
+	if (test_thread_flag(TIF_NOTIFY_RESUME))
 		tracehook_notify_resume(regs);
 }

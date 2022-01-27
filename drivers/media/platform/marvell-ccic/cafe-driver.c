@@ -44,10 +44,6 @@
 MODULE_AUTHOR("Jonathan Corbet <corbet@lwn.net>");
 MODULE_DESCRIPTION("Marvell 88ALP01 CMOS Camera Controller driver");
 MODULE_LICENSE("GPL");
-MODULE_SUPPORTED_DEVICE("Video");
-
-
-
 
 struct cafe_camera {
 	int registered;			/* Fully initialized? */
@@ -142,13 +138,6 @@ struct cafe_camera {
  * interface; all we have to do is to tell it where to route the data.
  */
 #define CAFE_SMBUS_TIMEOUT (HZ)  /* generous */
-
-static inline struct cafe_camera *to_cam(struct v4l2_device *dev)
-{
-	struct mcam_camera *m = container_of(dev, struct mcam_camera, v4l2_dev);
-	return container_of(m, struct cafe_camera, mcam);
-}
-
 
 static int cafe_smbus_write_done(struct mcam_camera *mcam)
 {
@@ -489,6 +478,8 @@ static int cafe_pci_probe(struct pci_dev *pdev,
 	int ret;
 	struct cafe_camera *cam;
 	struct mcam_camera *mcam;
+	struct v4l2_async_subdev *asd;
+	struct i2c_client *i2c_dev;
 
 	/*
 	 * Start putting together one of our big camera structures.
@@ -497,6 +488,7 @@ static int cafe_pci_probe(struct pci_dev *pdev,
 	cam = kzalloc(sizeof(struct cafe_camera), GFP_KERNEL);
 	if (cam == NULL)
 		goto out;
+	pci_set_drvdata(pdev, cam);
 	cam->pdev = pdev;
 	mcam = &cam->mcam;
 	mcam->chip_id = MCAM_CAFE;
@@ -545,9 +537,15 @@ static int cafe_pci_probe(struct pci_dev *pdev,
 	if (ret)
 		goto out_pdown;
 
-	mcam->asd.match_type = V4L2_ASYNC_MATCH_I2C;
-	mcam->asd.match.i2c.adapter_id = i2c_adapter_id(cam->i2c_adapter);
-	mcam->asd.match.i2c.address = ov7670_info.addr;
+	v4l2_async_nf_init(&mcam->notifier);
+
+	asd = v4l2_async_nf_add_i2c(&mcam->notifier,
+				    i2c_adapter_id(cam->i2c_adapter),
+				    ov7670_info.addr, struct v4l2_async_subdev);
+	if (IS_ERR(asd)) {
+		ret = PTR_ERR(asd);
+		goto out_smbus_shutdown;
+	}
 
 	ret = mccic_register(mcam);
 	if (ret)
@@ -556,11 +554,16 @@ static int cafe_pci_probe(struct pci_dev *pdev,
 	clkdev_create(mcam->mclk, "xclk", "%d-%04x",
 		i2c_adapter_id(cam->i2c_adapter), ov7670_info.addr);
 
-	if (!IS_ERR(i2c_new_client_device(cam->i2c_adapter, &ov7670_info))) {
-		cam->registered = 1;
-		return 0;
+	i2c_dev = i2c_new_client_device(cam->i2c_adapter, &ov7670_info);
+	if (IS_ERR(i2c_dev)) {
+		ret = PTR_ERR(i2c_dev);
+		goto out_mccic_shutdown;
 	}
 
+	cam->registered = 1;
+	return 0;
+
+out_mccic_shutdown:
 	mccic_shutdown(mcam);
 out_smbus_shutdown:
 	cafe_smbus_shutdown(cam);
@@ -592,8 +595,7 @@ static void cafe_shutdown(struct cafe_camera *cam)
 
 static void cafe_pci_remove(struct pci_dev *pdev)
 {
-	struct v4l2_device *v4l2_dev = dev_get_drvdata(&pdev->dev);
-	struct cafe_camera *cam = to_cam(v4l2_dev);
+	struct cafe_camera *cam = pci_get_drvdata(pdev);
 
 	if (cam == NULL) {
 		printk(KERN_WARNING "pci_remove on unknown pdev %p\n", pdev);
@@ -609,8 +611,7 @@ static void cafe_pci_remove(struct pci_dev *pdev)
  */
 static int __maybe_unused cafe_pci_suspend(struct device *dev)
 {
-	struct v4l2_device *v4l2_dev = dev_get_drvdata(dev);
-	struct cafe_camera *cam = to_cam(v4l2_dev);
+	struct cafe_camera *cam = dev_get_drvdata(dev);
 
 	mccic_suspend(&cam->mcam);
 	return 0;
@@ -619,8 +620,7 @@ static int __maybe_unused cafe_pci_suspend(struct device *dev)
 
 static int __maybe_unused cafe_pci_resume(struct device *dev)
 {
-	struct v4l2_device *v4l2_dev = dev_get_drvdata(dev);
-	struct cafe_camera *cam = to_cam(v4l2_dev);
+	struct cafe_camera *cam = dev_get_drvdata(dev);
 
 	cafe_ctlr_init(&cam->mcam);
 	return mccic_resume(&cam->mcam);

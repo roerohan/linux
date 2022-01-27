@@ -215,7 +215,7 @@ mext_page_mkuptodate(struct page *page, unsigned from, unsigned to)
 	for (i = 0; i < nr; i++) {
 		bh = arr[i];
 		if (!bh_uptodate_or_lock(bh)) {
-			err = bh_submit_read(bh);
+			err = ext4_read_bh(bh, 0, NULL);
 			if (err)
 				return err;
 		}
@@ -632,7 +632,6 @@ ext4_move_extents(struct file *o_filp, struct file *d_filp, __u64 orig_blk,
 		/* Check hole before the start pos */
 		if (cur_blk + cur_len - 1 < o_start) {
 			if (next_blk == EXT_MAX_BLOCKS) {
-				o_start = o_end;
 				ret = -ENODATA;
 				goto out;
 			}
