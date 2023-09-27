@@ -159,9 +159,12 @@ int pci_generic_config_write32(struct pci_bus *bus, unsigned int devfn,
 	 * write happen to have any RW1C (write-one-to-clear) bits set, we
 	 * just inadvertently cleared something we shouldn't have.
 	 */
-	dev_warn_ratelimited(&bus->dev, "%d-byte config write to %04x:%02x:%02x.%d offset %#x may corrupt adjacent RW1C bits\n",
-			     size, pci_domain_nr(bus), bus->number,
-			     PCI_SLOT(devfn), PCI_FUNC(devfn), where);
+	if (!bus->unsafe_warn) {
+		dev_warn(&bus->dev, "%d-byte config write to %04x:%02x:%02x.%d offset %#x may corrupt adjacent RW1C bits\n",
+			 size, pci_domain_nr(bus), bus->number,
+			 PCI_SLOT(devfn), PCI_FUNC(devfn), where);
+		bus->unsafe_warn = 1;
+	}
 
 	mask = ~(((1 << (size * 8)) - 1) << ((where & 0x3) * 8));
 	tmp = readl(addr) & mask;
@@ -347,6 +350,11 @@ bool pcie_cap_has_lnkctl(const struct pci_dev *dev)
 	       type == PCI_EXP_TYPE_PCIE_BRIDGE;
 }
 
+bool pcie_cap_has_lnkctl2(const struct pci_dev *dev)
+{
+	return pcie_cap_has_lnkctl(dev) && pcie_cap_version(dev) > 1;
+}
+
 static inline bool pcie_cap_has_sltctl(const struct pci_dev *dev)
 {
 	return pcie_downstream_port(dev) &&
@@ -387,10 +395,11 @@ static bool pcie_capability_reg_implemented(struct pci_dev *dev, int pos)
 		return pcie_cap_has_rtctl(dev);
 	case PCI_EXP_DEVCAP2:
 	case PCI_EXP_DEVCTL2:
+		return pcie_cap_version(dev) > 1;
 	case PCI_EXP_LNKCAP2:
 	case PCI_EXP_LNKCTL2:
 	case PCI_EXP_LNKSTA2:
-		return pcie_cap_version(dev) > 1;
+		return pcie_cap_has_lnkctl2(dev);
 	default:
 		return false;
 	}
@@ -488,22 +497,35 @@ int pcie_capability_write_dword(struct pci_dev *dev, int pos, u32 val)
 }
 EXPORT_SYMBOL(pcie_capability_write_dword);
 
-int pcie_capability_clear_and_set_word(struct pci_dev *dev, int pos,
-				       u16 clear, u16 set)
+int pcie_capability_clear_and_set_word_unlocked(struct pci_dev *dev, int pos,
+						u16 clear, u16 set)
 {
 	int ret;
 	u16 val;
 
 	ret = pcie_capability_read_word(dev, pos, &val);
-	if (!ret) {
-		val &= ~clear;
-		val |= set;
-		ret = pcie_capability_write_word(dev, pos, val);
-	}
+	if (ret)
+		return ret;
+
+	val &= ~clear;
+	val |= set;
+	return pcie_capability_write_word(dev, pos, val);
+}
+EXPORT_SYMBOL(pcie_capability_clear_and_set_word_unlocked);
+
+int pcie_capability_clear_and_set_word_locked(struct pci_dev *dev, int pos,
+					      u16 clear, u16 set)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&dev->pcie_cap_lock, flags);
+	ret = pcie_capability_clear_and_set_word_unlocked(dev, pos, clear, set);
+	spin_unlock_irqrestore(&dev->pcie_cap_lock, flags);
 
 	return ret;
 }
-EXPORT_SYMBOL(pcie_capability_clear_and_set_word);
+EXPORT_SYMBOL(pcie_capability_clear_and_set_word_locked);
 
 int pcie_capability_clear_and_set_dword(struct pci_dev *dev, int pos,
 					u32 clear, u32 set)
@@ -512,13 +534,12 @@ int pcie_capability_clear_and_set_dword(struct pci_dev *dev, int pos,
 	u32 val;
 
 	ret = pcie_capability_read_dword(dev, pos, &val);
-	if (!ret) {
-		val &= ~clear;
-		val |= set;
-		ret = pcie_capability_write_dword(dev, pos, val);
-	}
+	if (ret)
+		return ret;
 
-	return ret;
+	val &= ~clear;
+	val |= set;
+	return pcie_capability_write_dword(dev, pos, val);
 }
 EXPORT_SYMBOL(pcie_capability_clear_and_set_dword);
 

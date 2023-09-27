@@ -64,6 +64,8 @@ struct ifa6_config {
 	const struct in6_addr	*pfx;
 	unsigned int		plen;
 
+	u8			ifa_proto;
+
 	const struct in6_addr	*peer_pfx;
 
 	u32			rt_priority;
@@ -221,7 +223,7 @@ int ipv6_sock_mc_drop(struct sock *sk, int ifindex,
 		      const struct in6_addr *addr);
 void __ipv6_sock_mc_close(struct sock *sk);
 void ipv6_sock_mc_close(struct sock *sk);
-bool inet6_mc_check(struct sock *sk, const struct in6_addr *mc_addr,
+bool inet6_mc_check(const struct sock *sk, const struct in6_addr *mc_addr,
 		    const struct in6_addr *src_addr);
 
 int ipv6_dev_mc_inc(struct net_device *dev, const struct in6_addr *addr);
@@ -402,6 +404,9 @@ static inline void in6_dev_hold(struct inet6_dev *idev)
 static inline bool ip6_ignore_linkdown(const struct net_device *dev)
 {
 	const struct inet6_dev *idev = __in6_dev_get(dev);
+
+	if (unlikely(!idev))
+		return true;
 
 	return !!idev->cnf.ignore_routes_with_linkdown;
 }

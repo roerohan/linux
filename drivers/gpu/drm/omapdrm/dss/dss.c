@@ -1176,6 +1176,7 @@ static void __dss_uninit_ports(struct dss_device *dss, unsigned int num_ports)
 		default:
 			break;
 		}
+		of_node_put(port);
 	}
 }
 
@@ -1208,11 +1209,13 @@ static int dss_init_ports(struct dss_device *dss)
 		default:
 			break;
 		}
+		of_node_put(port);
 	}
 
 	return 0;
 
 error:
+	of_node_put(port);
 	__dss_uninit_ports(dss, i);
 	return r;
 }
@@ -1344,12 +1347,6 @@ static const struct component_master_ops dss_component_ops = {
 	.unbind = dss_unbind,
 };
 
-static int dss_component_compare(struct device *dev, void *data)
-{
-	struct device *child = data;
-	return dev == child;
-}
-
 struct dss_component_match_data {
 	struct device *dev;
 	struct component_match **match;
@@ -1379,7 +1376,7 @@ static int dss_add_child_component(struct device *dev, void *data)
 		return device_for_each_child(dev, cmatch,
 					     dss_add_child_component);
 
-	component_match_add(cmatch->dev, match, dss_component_compare, dev);
+	component_match_add(cmatch->dev, match, component_compare_dev, dev);
 
 	return 0;
 }
@@ -1535,7 +1532,7 @@ err_free_dss:
 	return r;
 }
 
-static int dss_remove(struct platform_device *pdev)
+static void dss_remove(struct platform_device *pdev)
 {
 	struct dss_device *dss = platform_get_drvdata(pdev);
 
@@ -1560,8 +1557,6 @@ static int dss_remove(struct platform_device *pdev)
 	dss_put_clocks(dss);
 
 	kfree(dss);
-
-	return 0;
 }
 
 static void dss_shutdown(struct platform_device *pdev)
@@ -1610,7 +1605,7 @@ static const struct dev_pm_ops dss_pm_ops = {
 
 struct platform_driver omap_dsshw_driver = {
 	.probe		= dss_probe,
-	.remove		= dss_remove,
+	.remove_new	= dss_remove,
 	.shutdown	= dss_shutdown,
 	.driver         = {
 		.name   = "omapdss_dss",

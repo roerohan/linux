@@ -533,6 +533,18 @@ static int byt_rt5640_aif1_hw_params(struct snd_pcm_substream *substream,
 
 /* Please keep this list alphabetically sorted */
 static const struct dmi_system_id byt_rt5640_quirk_table[] = {
+	{	/* Acer Iconia One 7 B1-750 */
+		.matches = {
+			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Insyde"),
+			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "VESPA2"),
+		},
+		.driver_data = (void *)(BYT_RT5640_DMIC1_MAP |
+					BYT_RT5640_JD_SRC_JD1_IN4P |
+					BYT_RT5640_OVCD_TH_1500UA |
+					BYT_RT5640_OVCD_SF_0P75 |
+					BYT_RT5640_SSP0_AIF1 |
+					BYT_RT5640_MCLK_EN),
+	},
 	{	/* Acer Iconia Tab 8 W1-810 */
 		.matches = {
 			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Acer"),
@@ -568,6 +580,21 @@ static const struct dmi_system_id byt_rt5640_quirk_table[] = {
 					BYT_RT5640_OVCD_TH_2000UA |
 					BYT_RT5640_OVCD_SF_0P75 |
 					BYT_RT5640_SSP0_AIF1 |
+					BYT_RT5640_MCLK_EN),
+	},
+	{
+		/* Advantech MICA-071 */
+		.matches = {
+			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Advantech"),
+			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "MICA-071"),
+		},
+		/* OVCD Th = 1500uA to reliable detect head-phones vs -set */
+		.driver_data = (void *)(BYT_RT5640_IN3_MAP |
+					BYT_RT5640_JD_SRC_JD2_IN4N |
+					BYT_RT5640_OVCD_TH_1500UA |
+					BYT_RT5640_OVCD_SF_0P75 |
+					BYT_RT5640_MONO_SPEAKER |
+					BYT_RT5640_DIFF_MIC |
 					BYT_RT5640_MCLK_EN),
 	},
 	{
@@ -773,6 +800,18 @@ static const struct dmi_system_id byt_rt5640_quirk_table[] = {
 					BYT_RT5640_OVCD_SF_0P75 |
 					BYT_RT5640_MCLK_EN),
 	},
+	{	/* HP Pro Tablet 408 */
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "Hewlett-Packard"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "HP Pro Tablet 408"),
+		},
+		.driver_data = (void *)(BYT_RT5640_DMIC1_MAP |
+					BYT_RT5640_JD_SRC_JD2_IN4N |
+					BYT_RT5640_OVCD_TH_1500UA |
+					BYT_RT5640_OVCD_SF_0P75 |
+					BYT_RT5640_SSP0_AIF1 |
+					BYT_RT5640_MCLK_EN),
+	},
 	{	/* HP Stream 7 */
 		.matches = {
 			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Hewlett-Packard"),
@@ -780,6 +819,16 @@ static const struct dmi_system_id byt_rt5640_quirk_table[] = {
 		},
 		.driver_data = (void *)(BYTCR_INPUT_DEFAULTS |
 					BYT_RT5640_MONO_SPEAKER |
+					BYT_RT5640_JD_NOT_INV |
+					BYT_RT5640_SSP0_AIF1 |
+					BYT_RT5640_MCLK_EN),
+	},
+	{	/* HP Stream 8 */
+		.matches = {
+			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Hewlett-Packard"),
+			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "HP Stream 8 Tablet"),
+		},
+		.driver_data = (void *)(BYTCR_INPUT_DEFAULTS |
 					BYT_RT5640_JD_NOT_INV |
 					BYT_RT5640_SSP0_AIF1 |
 					BYT_RT5640_MCLK_EN),
@@ -1179,12 +1228,14 @@ static int byt_rt5640_init(struct snd_soc_pcm_runtime *runtime)
 {
 	struct snd_soc_card *card = runtime->card;
 	struct byt_rt5640_private *priv = snd_soc_card_get_drvdata(card);
+	struct rt5640_set_jack_data *jack_data = &priv->jack_data;
 	struct snd_soc_component *component = asoc_rtd_to_codec(runtime, 0)->component;
 	const struct snd_soc_dapm_route *custom_map = NULL;
 	int num_routes = 0;
 	int ret;
 
 	card->dapm.idle_bias_off = true;
+	jack_data->use_platform_clock = true;
 
 	/* Start with RC clk for jack-detect (we disable MCLK below) */
 	if (byt_rt5640_quirk & BYT_RT5640_MCLK_EN)
@@ -1300,10 +1351,10 @@ static int byt_rt5640_init(struct snd_soc_pcm_runtime *runtime)
 	}
 
 	if (BYT_RT5640_JDSRC(byt_rt5640_quirk)) {
-		ret = snd_soc_card_jack_new(card, "Headset",
-					    SND_JACK_HEADSET | SND_JACK_BTN_0,
-					    &priv->jack, rt5640_pins,
-					    ARRAY_SIZE(rt5640_pins));
+		ret = snd_soc_card_jack_new_pins(card, "Headset",
+						 SND_JACK_HEADSET | SND_JACK_BTN_0,
+						 &priv->jack, rt5640_pins,
+						 ARRAY_SIZE(rt5640_pins));
 		if (ret) {
 			dev_err(card->dev, "Jack creation failed %d\n", ret);
 			return ret;
@@ -1321,17 +1372,17 @@ static int byt_rt5640_init(struct snd_soc_pcm_runtime *runtime)
 	}
 
 	if (byt_rt5640_quirk & BYT_RT5640_JD_HP_ELITEP_1000G2) {
-		ret = snd_soc_card_jack_new(card, "Headset",
-					    SND_JACK_HEADSET,
-					    &priv->jack, rt5640_pins,
-					    ARRAY_SIZE(rt5640_pins));
+		ret = snd_soc_card_jack_new_pins(card, "Headset",
+						 SND_JACK_HEADSET,
+						 &priv->jack, rt5640_pins,
+						 ARRAY_SIZE(rt5640_pins));
 		if (ret)
 			return ret;
 
-		ret = snd_soc_card_jack_new(card, "Headset 2",
-					    SND_JACK_HEADSET,
-					    &priv->jack2, rt5640_pins2,
-					    ARRAY_SIZE(rt5640_pins2));
+		ret = snd_soc_card_jack_new_pins(card, "Headset 2",
+						 SND_JACK_HEADSET,
+						 &priv->jack2, rt5640_pins2,
+						 ARRAY_SIZE(rt5640_pins2));
 		if (ret)
 			return ret;
 
@@ -1376,7 +1427,7 @@ static int byt_rt5640_codec_fixup(struct snd_soc_pcm_runtime *rtd,
 						SNDRV_PCM_HW_PARAM_CHANNELS);
 	int ret, bits;
 
-	/* The DSP will covert the FE rate to 48k, stereo */
+	/* The DSP will convert the FE rate to 48k, stereo */
 	rate->min = rate->max = 48000;
 	channels->min = channels->max = 2;
 
@@ -1399,7 +1450,7 @@ static int byt_rt5640_codec_fixup(struct snd_soc_pcm_runtime *rtd,
 	ret = snd_soc_dai_set_fmt(asoc_rtd_to_cpu(rtd, 0),
 				  SND_SOC_DAIFMT_I2S     |
 				  SND_SOC_DAIFMT_NB_NF   |
-				  SND_SOC_DAIFMT_CBC_CFC);
+				  SND_SOC_DAIFMT_BP_FP);
 	if (ret < 0) {
 		dev_err(rtd->dev, "can't set format to I2S, err %d\n", ret);
 		return ret;
@@ -1597,12 +1648,17 @@ static int snd_byt_rt5640_mc_probe(struct platform_device *pdev)
 	if (adev) {
 		snprintf(byt_rt5640_codec_name, sizeof(byt_rt5640_codec_name),
 			 "i2c-%s", acpi_dev_name(adev));
-		put_device(&adev->dev);
 		byt_rt5640_dais[dai_index].codecs->name = byt_rt5640_codec_name;
 	} else {
 		dev_err(dev, "Error cannot find '%s' dev\n", mach->id);
 		return -ENXIO;
 	}
+
+	codec_dev = acpi_get_first_physical_node(adev);
+	acpi_dev_put(adev);
+	if (!codec_dev)
+		return -EPROBE_DEFER;
+	priv->codec_dev = get_device(codec_dev);
 
 	/*
 	 * swap SSP0 if bytcr is detected
@@ -1622,7 +1678,7 @@ static int snd_byt_rt5640_mc_probe(struct platform_device *pdev)
 		 * with the codec driver/pdata are non-existent
 		 */
 
-		struct acpi_chan_package chan_package;
+		struct acpi_chan_package chan_package = { 0 };
 
 		/* format specified: 2 64-bit integers */
 		struct acpi_buffer format = {sizeof("NN"), "NN"};
@@ -1677,11 +1733,6 @@ static int snd_byt_rt5640_mc_probe(struct platform_device *pdev)
 			 byt_rt5640_quirk, quirk_override);
 		byt_rt5640_quirk = quirk_override;
 	}
-
-	codec_dev = acpi_get_first_physical_node(adev);
-	if (!codec_dev)
-		return -EPROBE_DEFER;
-	priv->codec_dev = get_device(codec_dev);
 
 	if (byt_rt5640_quirk & BYT_RT5640_JD_HP_ELITEP_1000G2) {
 		acpi_dev_add_driver_gpios(ACPI_COMPANION(priv->codec_dev),
@@ -1764,7 +1815,7 @@ static int snd_byt_rt5640_mc_probe(struct platform_device *pdev)
 	byt_rt5640_card.long_name = byt_rt5640_long_name;
 #endif
 
-	/* override plaform name, if required */
+	/* override platform name, if required */
 	platform_name = mach->mach_params.platform;
 
 	ret_val = snd_soc_fixup_dai_links_platform_name(&byt_rt5640_card,
@@ -1805,7 +1856,7 @@ err_device:
 	return ret_val;
 }
 
-static int snd_byt_rt5640_mc_remove(struct platform_device *pdev)
+static void snd_byt_rt5640_mc_remove(struct platform_device *pdev)
 {
 	struct snd_soc_card *card = platform_get_drvdata(pdev);
 	struct byt_rt5640_private *priv = snd_soc_card_get_drvdata(card);
@@ -1815,7 +1866,6 @@ static int snd_byt_rt5640_mc_remove(struct platform_device *pdev)
 
 	device_remove_software_node(priv->codec_dev);
 	put_device(priv->codec_dev);
-	return 0;
 }
 
 static struct platform_driver snd_byt_rt5640_mc_driver = {
@@ -1823,7 +1873,7 @@ static struct platform_driver snd_byt_rt5640_mc_driver = {
 		.name = "bytcr_rt5640",
 	},
 	.probe = snd_byt_rt5640_mc_probe,
-	.remove = snd_byt_rt5640_mc_remove,
+	.remove_new = snd_byt_rt5640_mc_remove,
 };
 
 module_platform_driver(snd_byt_rt5640_mc_driver);

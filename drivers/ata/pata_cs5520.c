@@ -94,7 +94,7 @@ static void cs5520_set_piomode(struct ata_port *ap, struct ata_device *adev)
 	cs5520_set_timings(ap, adev, adev->pio_mode);
 }
 
-static struct scsi_host_template cs5520_sht = {
+static const struct scsi_host_template cs5520_sht = {
 	ATA_BASE_SHT(DRV_NAME),
 	.sg_tablesize		= LIBATA_DUMB_MAX_PRD,
 	.dma_boundary		= ATA_DMA_BOUNDARY,
@@ -259,11 +259,8 @@ static int cs5520_reinit_one(struct pci_dev *pdev)
 static int cs5520_pci_device_suspend(struct pci_dev *pdev, pm_message_t mesg)
 {
 	struct ata_host *host = pci_get_drvdata(pdev);
-	int rc = 0;
 
-	rc = ata_host_suspend(host, mesg);
-	if (rc)
-		return rc;
+	ata_host_suspend(host, mesg);
 
 	pci_save_state(pdev);
 	return 0;

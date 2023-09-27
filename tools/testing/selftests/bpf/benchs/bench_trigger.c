@@ -13,8 +13,8 @@ static struct counter base_hits;
 
 static void trigger_validate(void)
 {
-	if (env.consumer_cnt != 1) {
-		fprintf(stderr, "benchmark doesn't support multi-consumer!\n");
+	if (env.consumer_cnt != 0) {
+		fprintf(stderr, "benchmark doesn't support consumer!\n");
 		exit(1);
 	}
 }
@@ -103,11 +103,6 @@ static void trigger_fmodret_setup(void)
 	attach_bpf(ctx.skel->progs.bench_trigger_fmodret);
 }
 
-static void *trigger_consumer(void *input)
-{
-	return NULL;
-}
-
 /* make sure call is not inlined and not avoided by compiler, so __weak and
  * inline asm volatile in the body of the function
  *
@@ -154,7 +149,6 @@ static void *uprobe_producer_without_nop(void *input)
 static void usetup(bool use_retprobe, bool use_nop)
 {
 	size_t uprobe_offset;
-	ssize_t base_addr;
 	struct bpf_link *link;
 
 	setup_libbpf();
@@ -165,11 +159,10 @@ static void usetup(bool use_retprobe, bool use_nop)
 		exit(1);
 	}
 
-	base_addr = get_base_addr();
 	if (use_nop)
-		uprobe_offset = get_uprobe_offset(&uprobe_target_with_nop, base_addr);
+		uprobe_offset = get_uprobe_offset(&uprobe_target_with_nop);
 	else
-		uprobe_offset = get_uprobe_offset(&uprobe_target_without_nop, base_addr);
+		uprobe_offset = get_uprobe_offset(&uprobe_target_without_nop);
 
 	link = bpf_program__attach_uprobe(ctx.skel->progs.bench_trigger_uprobe,
 					  use_retprobe,
@@ -207,7 +200,6 @@ const struct bench bench_trig_base = {
 	.name = "trig-base",
 	.validate = trigger_validate,
 	.producer_thread = trigger_base_producer,
-	.consumer_thread = trigger_consumer,
 	.measure = trigger_base_measure,
 	.report_progress = hits_drops_report_progress,
 	.report_final = hits_drops_report_final,
@@ -218,7 +210,6 @@ const struct bench bench_trig_tp = {
 	.validate = trigger_validate,
 	.setup = trigger_tp_setup,
 	.producer_thread = trigger_producer,
-	.consumer_thread = trigger_consumer,
 	.measure = trigger_measure,
 	.report_progress = hits_drops_report_progress,
 	.report_final = hits_drops_report_final,
@@ -229,7 +220,6 @@ const struct bench bench_trig_rawtp = {
 	.validate = trigger_validate,
 	.setup = trigger_rawtp_setup,
 	.producer_thread = trigger_producer,
-	.consumer_thread = trigger_consumer,
 	.measure = trigger_measure,
 	.report_progress = hits_drops_report_progress,
 	.report_final = hits_drops_report_final,
@@ -240,7 +230,6 @@ const struct bench bench_trig_kprobe = {
 	.validate = trigger_validate,
 	.setup = trigger_kprobe_setup,
 	.producer_thread = trigger_producer,
-	.consumer_thread = trigger_consumer,
 	.measure = trigger_measure,
 	.report_progress = hits_drops_report_progress,
 	.report_final = hits_drops_report_final,
@@ -251,7 +240,6 @@ const struct bench bench_trig_fentry = {
 	.validate = trigger_validate,
 	.setup = trigger_fentry_setup,
 	.producer_thread = trigger_producer,
-	.consumer_thread = trigger_consumer,
 	.measure = trigger_measure,
 	.report_progress = hits_drops_report_progress,
 	.report_final = hits_drops_report_final,
@@ -262,7 +250,6 @@ const struct bench bench_trig_fentry_sleep = {
 	.validate = trigger_validate,
 	.setup = trigger_fentry_sleep_setup,
 	.producer_thread = trigger_producer,
-	.consumer_thread = trigger_consumer,
 	.measure = trigger_measure,
 	.report_progress = hits_drops_report_progress,
 	.report_final = hits_drops_report_final,
@@ -273,7 +260,6 @@ const struct bench bench_trig_fmodret = {
 	.validate = trigger_validate,
 	.setup = trigger_fmodret_setup,
 	.producer_thread = trigger_producer,
-	.consumer_thread = trigger_consumer,
 	.measure = trigger_measure,
 	.report_progress = hits_drops_report_progress,
 	.report_final = hits_drops_report_final,
@@ -283,7 +269,6 @@ const struct bench bench_trig_uprobe_base = {
 	.name = "trig-uprobe-base",
 	.setup = NULL, /* no uprobe/uretprobe is attached */
 	.producer_thread = uprobe_base_producer,
-	.consumer_thread = trigger_consumer,
 	.measure = trigger_base_measure,
 	.report_progress = hits_drops_report_progress,
 	.report_final = hits_drops_report_final,
@@ -293,7 +278,6 @@ const struct bench bench_trig_uprobe_with_nop = {
 	.name = "trig-uprobe-with-nop",
 	.setup = uprobe_setup_with_nop,
 	.producer_thread = uprobe_producer_with_nop,
-	.consumer_thread = trigger_consumer,
 	.measure = trigger_measure,
 	.report_progress = hits_drops_report_progress,
 	.report_final = hits_drops_report_final,
@@ -303,7 +287,6 @@ const struct bench bench_trig_uretprobe_with_nop = {
 	.name = "trig-uretprobe-with-nop",
 	.setup = uretprobe_setup_with_nop,
 	.producer_thread = uprobe_producer_with_nop,
-	.consumer_thread = trigger_consumer,
 	.measure = trigger_measure,
 	.report_progress = hits_drops_report_progress,
 	.report_final = hits_drops_report_final,
@@ -313,7 +296,6 @@ const struct bench bench_trig_uprobe_without_nop = {
 	.name = "trig-uprobe-without-nop",
 	.setup = uprobe_setup_without_nop,
 	.producer_thread = uprobe_producer_without_nop,
-	.consumer_thread = trigger_consumer,
 	.measure = trigger_measure,
 	.report_progress = hits_drops_report_progress,
 	.report_final = hits_drops_report_final,
@@ -323,7 +305,6 @@ const struct bench bench_trig_uretprobe_without_nop = {
 	.name = "trig-uretprobe-without-nop",
 	.setup = uretprobe_setup_without_nop,
 	.producer_thread = uprobe_producer_without_nop,
-	.consumer_thread = trigger_consumer,
 	.measure = trigger_measure,
 	.report_progress = hits_drops_report_progress,
 	.report_final = hits_drops_report_final,

@@ -14,6 +14,11 @@
 #include <linux/netfs.h>
 #include "internal.h"
 
+static int afs_writepages_region(struct address_space *mapping,
+				 struct writeback_control *wbc,
+				 loff_t start, loff_t end, loff_t *_next,
+				 bool max_one_loop);
+
 static void afs_write_to_cache(struct afs_vnode *vnode, loff_t start, size_t len,
 			       loff_t i_size, bool caching);
 
@@ -22,9 +27,10 @@ static void afs_write_to_cache(struct afs_vnode *vnode, loff_t start, size_t len
  * Mark a page as having been made dirty and thus needing writeback.  We also
  * need to pin the cache object to write back to.
  */
-int afs_set_page_dirty(struct page *page)
+bool afs_dirty_folio(struct address_space *mapping, struct folio *folio)
 {
-	return fscache_set_page_dirty(page, afs_vnode_cache(AFS_FS_I(page->mapping->host)));
+	return fscache_dirty_folio(mapping, folio,
+				afs_vnode_cache(AFS_FS_I(mapping->host)));
 }
 static void afs_folio_start_fscache(bool caching, struct folio *folio)
 {
@@ -38,10 +44,29 @@ static void afs_folio_start_fscache(bool caching, struct folio *folio)
 #endif
 
 /*
+ * Flush out a conflicting write.  This may extend the write to the surrounding
+ * pages if also dirty and contiguous to the conflicting region..
+ */
+static int afs_flush_conflicting_write(struct address_space *mapping,
+				       struct folio *folio)
+{
+	struct writeback_control wbc = {
+		.sync_mode	= WB_SYNC_ALL,
+		.nr_to_write	= LONG_MAX,
+		.range_start	= folio_pos(folio),
+		.range_end	= LLONG_MAX,
+	};
+	loff_t next;
+
+	return afs_writepages_region(mapping, &wbc, folio_pos(folio), LLONG_MAX,
+				     &next, true);
+}
+
+/*
  * prepare to perform part of a write to a page
  */
 int afs_write_begin(struct file *file, struct address_space *mapping,
-		    loff_t pos, unsigned len, unsigned flags,
+		    loff_t pos, unsigned len,
 		    struct page **_page, void **fsdata)
 {
 	struct afs_vnode *vnode = AFS_FS_I(file_inode(file));
@@ -59,8 +84,7 @@ int afs_write_begin(struct file *file, struct address_space *mapping,
 	 * file.  We need to do this before we get a lock on the page in case
 	 * there's more than one writer competing for the same cache block.
 	 */
-	ret = netfs_write_begin(file, mapping, pos, len, flags, &folio, fsdata,
-				&afs_req_ops, NULL);
+	ret = netfs_write_begin(&vnode->netfs, file, mapping, pos, len, &folio, fsdata);
 	if (ret < 0)
 		return ret;
 
@@ -80,7 +104,8 @@ try_again:
 
 		if (folio_test_writeback(folio)) {
 			trace_afs_folio_dirty(vnode, tracepoint_string("alrdy"), folio);
-			goto flush_conflicting_write;
+			folio_unlock(folio);
+			goto wait_for_writeback;
 		}
 		/* If the file is being filled locally, allow inter-write
 		 * spaces to be merged into writes.  If it's not, only write
@@ -91,7 +116,7 @@ try_again:
 			goto flush_conflicting_write;
 	}
 
-	*_page = &folio->page;
+	*_page = folio_file_page(folio, pos / PAGE_SIZE);
 	_leave(" = 0");
 	return 0;
 
@@ -99,8 +124,15 @@ try_again:
 	 * flush the page out.
 	 */
 flush_conflicting_write:
-	_debug("flush conflict");
-	ret = folio_write_one(folio);
+	trace_afs_folio_dirty(vnode, tracepoint_string("confl"), folio);
+	folio_unlock(folio);
+
+	ret = afs_flush_conflicting_write(mapping, folio);
+	if (ret < 0)
+		goto error;
+
+wait_for_writeback:
+	ret = folio_wait_writeback_killable(folio);
 	if (ret < 0)
 		goto error;
 
@@ -146,10 +178,10 @@ int afs_write_end(struct file *file, struct address_space *mapping,
 
 	write_end_pos = pos + copied;
 
-	i_size = i_size_read(&vnode->vfs_inode);
+	i_size = i_size_read(&vnode->netfs.inode);
 	if (write_end_pos > i_size) {
 		write_seqlock(&vnode->cb_lock);
-		i_size = i_size_read(&vnode->vfs_inode);
+		i_size = i_size_read(&vnode->netfs.inode);
 		if (write_end_pos > i_size)
 			afs_set_i_size(vnode, write_end_pos);
 		write_sequnlock(&vnode->cb_lock);
@@ -200,7 +232,7 @@ static void afs_kill_pages(struct address_space *mapping,
 		_debug("kill %lx (to %lx)", index, last);
 
 		folio = filemap_get_folio(mapping, index);
-		if (!folio) {
+		if (IS_ERR(folio)) {
 			next = index + 1;
 			continue;
 		}
@@ -238,7 +270,7 @@ static void afs_redirty_pages(struct writeback_control *wbc,
 		_debug("redirty %llx @%llx", len, start);
 
 		folio = filemap_get_folio(mapping, index);
-		if (!folio) {
+		if (IS_ERR(folio)) {
 			next = index + 1;
 			continue;
 		}
@@ -257,7 +289,7 @@ static void afs_redirty_pages(struct writeback_control *wbc,
  */
 static void afs_pages_written_back(struct afs_vnode *vnode, loff_t start, unsigned int len)
 {
-	struct address_space *mapping = vnode->vfs_inode.i_mapping;
+	struct address_space *mapping = vnode->netfs.inode.i_mapping;
 	struct folio *folio;
 	pgoff_t end;
 
@@ -356,7 +388,7 @@ static int afs_store_data(struct afs_vnode *vnode, struct iov_iter *iter, loff_t
 {
 	struct afs_operation *op;
 	struct afs_wb_key *wbk = NULL;
-	loff_t size = iov_iter_count(iter), i_size;
+	loff_t size = iov_iter_count(iter);
 	int ret = -ENOKEY;
 
 	_enter("%s{%llx:%llu.%u},%llx,%llx",
@@ -378,22 +410,22 @@ static int afs_store_data(struct afs_vnode *vnode, struct iov_iter *iter, loff_t
 		return -ENOMEM;
 	}
 
-	i_size = i_size_read(&vnode->vfs_inode);
-
 	afs_op_set_vnode(op, 0, vnode);
 	op->file[0].dv_delta = 1;
 	op->file[0].modification = true;
-	op->store.write_iter = iter;
 	op->store.pos = pos;
 	op->store.size = size;
-	op->store.i_size = max(pos + size, i_size);
 	op->store.laundering = laundering;
-	op->mtime = vnode->vfs_inode.i_mtime;
 	op->flags |= AFS_OPERATION_UNINTR;
 	op->ops = &afs_store_data_operation;
 
 try_next_key:
 	afs_begin_vnode_operation(op);
+
+	op->store.write_iter = iter;
+	op->store.i_size = max(pos + size, vnode->netfs.remote_i_size);
+	op->mtime = vnode->netfs.inode.i_mtime;
+
 	afs_wait_for_operation(op);
 
 	switch (op->error) {
@@ -435,7 +467,7 @@ static void afs_extend_writeback(struct address_space *mapping,
 				 bool caching,
 				 unsigned int *_len)
 {
-	struct pagevec pvec;
+	struct folio_batch fbatch;
 	struct folio *folio;
 	unsigned long priv;
 	unsigned int psize, filler = 0;
@@ -446,7 +478,7 @@ static void afs_extend_writeback(struct address_space *mapping,
 	unsigned int i;
 
 	XA_STATE(xas, &mapping->i_pages, index);
-	pagevec_init(&pvec);
+	folio_batch_init(&fbatch);
 
 	do {
 		/* Firstly, we gather up a batch of contiguous dirty pages
@@ -505,7 +537,7 @@ static void afs_extend_writeback(struct address_space *mapping,
 				stop = false;
 
 			index += folio_nr_pages(folio);
-			if (!pagevec_add(&pvec, &folio->page))
+			if (!folio_batch_add(&fbatch, folio))
 				break;
 			if (stop)
 				break;
@@ -515,14 +547,14 @@ static void afs_extend_writeback(struct address_space *mapping,
 			xas_pause(&xas);
 		rcu_read_unlock();
 
-		/* Now, if we obtained any pages, we can shift them to being
+		/* Now, if we obtained any folios, we can shift them to being
 		 * writable and mark them for caching.
 		 */
-		if (!pagevec_count(&pvec))
+		if (!folio_batch_count(&fbatch))
 			break;
 
-		for (i = 0; i < pagevec_count(&pvec); i++) {
-			folio = page_folio(pvec.pages[i]);
+		for (i = 0; i < folio_batch_count(&fbatch); i++) {
+			folio = fbatch.folios[i];
 			trace_afs_folio_dirty(vnode, tracepoint_string("store+"), folio);
 
 			if (!folio_clear_dirty_for_io(folio))
@@ -535,7 +567,7 @@ static void afs_extend_writeback(struct address_space *mapping,
 			folio_unlock(folio);
 		}
 
-		pagevec_release(&pvec);
+		folio_batch_release(&fbatch);
 		cond_resched();
 	} while (!stop);
 
@@ -555,7 +587,7 @@ static ssize_t afs_write_back_from_locked_folio(struct address_space *mapping,
 	struct iov_iter iter;
 	unsigned long priv;
 	unsigned int offset, to, len, max_len;
-	loff_t i_size = i_size_read(&vnode->vfs_inode);
+	loff_t i_size = i_size_read(&vnode->netfs.inode);
 	bool new_content = test_bit(AFS_VNODE_NEW_CONTENT, &vnode->flags);
 	bool caching = fscache_cookie_enabled(afs_vnode_cache(vnode));
 	long count = wbc->nr_to_write;
@@ -611,14 +643,13 @@ static ssize_t afs_write_back_from_locked_folio(struct address_space *mapping,
 		 */
 		afs_write_to_cache(vnode, start, len, i_size, caching);
 
-		iov_iter_xarray(&iter, WRITE, &mapping->i_pages, start, len);
+		iov_iter_xarray(&iter, ITER_SOURCE, &mapping->i_pages, start, len);
 		ret = afs_store_data(vnode, &iter, start, false);
 	} else {
 		_debug("write discard %x @%llx [%llx]", len, start, i_size);
 
 		/* The dirty region was entirely beyond the EOF. */
-		fscache_clear_page_bits(afs_vnode_cache(vnode),
-					mapping, start, len, caching);
+		fscache_clear_page_bits(mapping, start, len, caching);
 		afs_pages_written_back(vnode, start, len);
 		ret = 0;
 	}
@@ -638,6 +669,7 @@ static ssize_t afs_write_back_from_locked_folio(struct address_space *mapping,
 	case -EKEYEXPIRED:
 	case -EKEYREJECTED:
 	case -EKEYREVOKED:
+	case -ENETRESET:
 		afs_redirty_pages(wbc, mapping, start, len);
 		mapping_set_error(mapping, ret);
 		break;
@@ -666,110 +698,98 @@ static ssize_t afs_write_back_from_locked_folio(struct address_space *mapping,
 }
 
 /*
- * write a page back to the server
- * - the caller locked the page for us
- */
-int afs_writepage(struct page *subpage, struct writeback_control *wbc)
-{
-	struct folio *folio = page_folio(subpage);
-	ssize_t ret;
-	loff_t start;
-
-	_enter("{%lx},", folio_index(folio));
-
-#ifdef CONFIG_AFS_FSCACHE
-	folio_wait_fscache(folio);
-#endif
-
-	start = folio_index(folio) * PAGE_SIZE;
-	ret = afs_write_back_from_locked_folio(folio_mapping(folio), wbc,
-					       folio, start, LLONG_MAX - start);
-	if (ret < 0) {
-		_leave(" = %zd", ret);
-		return ret;
-	}
-
-	_leave(" = 0");
-	return 0;
-}
-
-/*
  * write a region of pages back to the server
  */
 static int afs_writepages_region(struct address_space *mapping,
 				 struct writeback_control *wbc,
-				 loff_t start, loff_t end, loff_t *_next)
+				 loff_t start, loff_t end, loff_t *_next,
+				 bool max_one_loop)
 {
 	struct folio *folio;
-	struct page *head_page;
+	struct folio_batch fbatch;
 	ssize_t ret;
-	int n;
+	unsigned int i;
+	int n, skips = 0;
 
 	_enter("%llx,%llx,", start, end);
+	folio_batch_init(&fbatch);
 
 	do {
 		pgoff_t index = start / PAGE_SIZE;
 
-		n = find_get_pages_range_tag(mapping, &index, end / PAGE_SIZE,
-					     PAGECACHE_TAG_DIRTY, 1, &head_page);
+		n = filemap_get_folios_tag(mapping, &index, end / PAGE_SIZE,
+					PAGECACHE_TAG_DIRTY, &fbatch);
+
 		if (!n)
 			break;
+		for (i = 0; i < n; i++) {
+			folio = fbatch.folios[i];
+			start = folio_pos(folio); /* May regress with THPs */
 
-		folio = page_folio(head_page);
-		start = folio_pos(folio); /* May regress with THPs */
+			_debug("wback %lx", folio_index(folio));
 
-		_debug("wback %lx", folio_index(folio));
+			/* At this point we hold neither the i_pages lock nor the
+			 * page lock: the page may be truncated or invalidated
+			 * (changing page->mapping to NULL), or even swizzled
+			 * back from swapper_space to tmpfs file mapping
+			 */
+try_again:
+			if (wbc->sync_mode != WB_SYNC_NONE) {
+				ret = folio_lock_killable(folio);
+				if (ret < 0) {
+					folio_batch_release(&fbatch);
+					return ret;
+				}
+			} else {
+				if (!folio_trylock(folio))
+					continue;
+			}
 
-		/* At this point we hold neither the i_pages lock nor the
-		 * page lock: the page may be truncated or invalidated
-		 * (changing page->mapping to NULL), or even swizzled
-		 * back from swapper_space to tmpfs file mapping
-		 */
-		if (wbc->sync_mode != WB_SYNC_NONE) {
-			ret = folio_lock_killable(folio);
+			if (folio->mapping != mapping ||
+			    !folio_test_dirty(folio)) {
+				start += folio_size(folio);
+				folio_unlock(folio);
+				continue;
+			}
+
+			if (folio_test_writeback(folio) ||
+			    folio_test_fscache(folio)) {
+				folio_unlock(folio);
+				if (wbc->sync_mode != WB_SYNC_NONE) {
+					folio_wait_writeback(folio);
+#ifdef CONFIG_AFS_FSCACHE
+					folio_wait_fscache(folio);
+#endif
+					goto try_again;
+				}
+
+				start += folio_size(folio);
+				if (wbc->sync_mode == WB_SYNC_NONE) {
+					if (skips >= 5 || need_resched()) {
+						*_next = start;
+						folio_batch_release(&fbatch);
+						_leave(" = 0 [%llx]", *_next);
+						return 0;
+					}
+					skips++;
+				}
+				continue;
+			}
+
+			if (!folio_clear_dirty_for_io(folio))
+				BUG();
+			ret = afs_write_back_from_locked_folio(mapping, wbc,
+					folio, start, end);
 			if (ret < 0) {
-				folio_put(folio);
+				_leave(" = %zd", ret);
+				folio_batch_release(&fbatch);
 				return ret;
 			}
-		} else {
-			if (!folio_trylock(folio)) {
-				folio_put(folio);
-				return 0;
-			}
+
+			start += ret;
 		}
 
-		if (folio_mapping(folio) != mapping ||
-		    !folio_test_dirty(folio)) {
-			start += folio_size(folio);
-			folio_unlock(folio);
-			folio_put(folio);
-			continue;
-		}
-
-		if (folio_test_writeback(folio) ||
-		    folio_test_fscache(folio)) {
-			folio_unlock(folio);
-			if (wbc->sync_mode != WB_SYNC_NONE) {
-				folio_wait_writeback(folio);
-#ifdef CONFIG_AFS_FSCACHE
-				folio_wait_fscache(folio);
-#endif
-			}
-			folio_put(folio);
-			continue;
-		}
-
-		if (!folio_clear_dirty_for_io(folio))
-			BUG();
-		ret = afs_write_back_from_locked_folio(mapping, wbc, folio, start, end);
-		folio_put(folio);
-		if (ret < 0) {
-			_leave(" = %zd", ret);
-			return ret;
-		}
-
-		start += ret;
-
+		folio_batch_release(&fbatch);
 		cond_resched();
 	} while (wbc->nr_to_write > 0);
 
@@ -801,24 +821,27 @@ int afs_writepages(struct address_space *mapping,
 
 	if (wbc->range_cyclic) {
 		start = mapping->writeback_index * PAGE_SIZE;
-		ret = afs_writepages_region(mapping, wbc, start, LLONG_MAX, &next);
+		ret = afs_writepages_region(mapping, wbc, start, LLONG_MAX,
+					    &next, false);
 		if (ret == 0) {
 			mapping->writeback_index = next / PAGE_SIZE;
 			if (start > 0 && wbc->nr_to_write > 0) {
 				ret = afs_writepages_region(mapping, wbc, 0,
-							    start, &next);
+							    start, &next, false);
 				if (ret == 0)
 					mapping->writeback_index =
 						next / PAGE_SIZE;
 			}
 		}
 	} else if (wbc->range_start == 0 && wbc->range_end == LLONG_MAX) {
-		ret = afs_writepages_region(mapping, wbc, 0, LLONG_MAX, &next);
+		ret = afs_writepages_region(mapping, wbc, 0, LLONG_MAX,
+					    &next, false);
 		if (wbc->nr_to_write > 0 && ret == 0)
 			mapping->writeback_index = next / PAGE_SIZE;
 	} else {
 		ret = afs_writepages_region(mapping, wbc,
-					    wbc->range_start, wbc->range_end, &next);
+					    wbc->range_start, wbc->range_end,
+					    &next, false);
 	}
 
 	up_read(&vnode->validate_lock);
@@ -839,7 +862,7 @@ ssize_t afs_file_write(struct kiocb *iocb, struct iov_iter *from)
 	_enter("{%llx:%llu},{%zu},",
 	       vnode->fid.vid, vnode->fid.vnode, count);
 
-	if (IS_SWAPFILE(&vnode->vfs_inode)) {
+	if (IS_SWAPFILE(&vnode->netfs.inode)) {
 		printk(KERN_INFO
 		       "AFS: Attempt to write to active swap file!\n");
 		return -EBUSY;
@@ -952,8 +975,8 @@ void afs_prune_wb_keys(struct afs_vnode *vnode)
 	/* Discard unused keys */
 	spin_lock(&vnode->wb_lock);
 
-	if (!mapping_tagged(&vnode->vfs_inode.i_data, PAGECACHE_TAG_WRITEBACK) &&
-	    !mapping_tagged(&vnode->vfs_inode.i_data, PAGECACHE_TAG_DIRTY)) {
+	if (!mapping_tagged(&vnode->netfs.inode.i_data, PAGECACHE_TAG_WRITEBACK) &&
+	    !mapping_tagged(&vnode->netfs.inode.i_data, PAGECACHE_TAG_DIRTY)) {
 		list_for_each_entry_safe(wbk, tmp, &vnode->wb_keys, vnode_link) {
 			if (refcount_read(&wbk->usage) == 1)
 				list_move(&wbk->vnode_link, &graveyard);
@@ -972,17 +995,16 @@ void afs_prune_wb_keys(struct afs_vnode *vnode)
 /*
  * Clean up a page during invalidation.
  */
-int afs_launder_page(struct page *subpage)
+int afs_launder_folio(struct folio *folio)
 {
-	struct folio *folio = page_folio(subpage);
 	struct afs_vnode *vnode = AFS_FS_I(folio_inode(folio));
 	struct iov_iter iter;
-	struct bio_vec bv[1];
+	struct bio_vec bv;
 	unsigned long priv;
 	unsigned int f, t;
 	int ret = 0;
 
-	_enter("{%lx}", folio_index(folio));
+	_enter("{%lx}", folio->index);
 
 	priv = (unsigned long)folio_get_private(folio);
 	if (folio_clear_dirty_for_io(folio)) {
@@ -993,10 +1015,8 @@ int afs_launder_page(struct page *subpage)
 			t = afs_folio_dirty_to(folio, priv);
 		}
 
-		bv[0].bv_page = &folio->page;
-		bv[0].bv_offset = f;
-		bv[0].bv_len = t - f;
-		iov_iter_bvec(&iter, WRITE, bv, 1, bv[0].bv_len);
+		bvec_set_folio(&bv, folio, t - f, f);
+		iov_iter_bvec(&iter, ITER_SOURCE, &bv, 1, bv.bv_len);
 
 		trace_afs_folio_dirty(vnode, tracepoint_string("launder"), folio);
 		ret = afs_store_data(vnode, &iter, folio_pos(folio) + f, true);
@@ -1029,6 +1049,6 @@ static void afs_write_to_cache(struct afs_vnode *vnode,
 			       bool caching)
 {
 	fscache_write_to_cache(afs_vnode_cache(vnode),
-			       vnode->vfs_inode.i_mapping, start, len, i_size,
+			       vnode->netfs.inode.i_mapping, start, len, i_size,
 			       afs_write_to_cache_done, vnode, caching);
 }

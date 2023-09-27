@@ -70,6 +70,10 @@ NSB_LO_IP6=2001:db8:2::2
 NL_IP=172.17.1.1
 NL_IP6=2001:db8:4::1
 
+# multicast and broadcast addresses
+MCAST_IP=224.0.0.1
+BCAST_IP=255.255.255.255
+
 MD5_PW=abc123
 MD5_WRONG_PW=abc1234
 
@@ -87,6 +91,13 @@ NSB_CMD="ip netns exec ${NSB}"
 NSC_CMD="ip netns exec ${NSC}"
 
 which ping6 > /dev/null 2>&1 && ping6=$(which ping6) || ping6=$(which ping)
+
+# Check if FIPS mode is enabled
+if [ -f /proc/sys/crypto/fips_enabled ]; then
+	fips_enabled=`cat /proc/sys/crypto/fips_enabled`
+else
+	fips_enabled=0
+fi
 
 ################################################################################
 # utilities
@@ -307,6 +318,9 @@ addr2str()
 	case "$1" in
 	127.0.0.1) echo "loopback";;
 	::1) echo "IPv6 loopback";;
+
+	${BCAST_IP}) echo "broadcast";;
+	${MCAST_IP}) echo "multicast";;
 
 	${NSA_IP})	echo "ns-A IP";;
 	${NSA_IP6})	echo "ns-A IPv6";;
@@ -578,6 +592,20 @@ ipv4_ping_novrf()
 	done
 
 	#
+	# out, but don't use gateway if peer is not on link
+	#
+	a=${NSB_IP}
+	log_start
+	run_cmd ping -c 1 -w 1 -r ${a}
+	log_test_addr ${a} $? 0 "ping out (don't route), peer on link"
+
+	a=${NSB_LO_IP}
+	log_start
+	show_hint "Fails since peer is not on link"
+	run_cmd ping -c 1 -w 1 -r ${a}
+	log_test_addr ${a} $? 1 "ping out (don't route), peer not on link"
+
+	#
 	# in
 	#
 	for a in ${NSA_IP} ${NSA_LO_IP}
@@ -750,7 +778,7 @@ ipv4_ping_vrf()
 		log_start
 		show_hint "Fails since address on vrf device is out of device scope"
 		run_cmd ping -c1 -w1 -I ${NSA_DEV} ${a}
-		log_test_addr ${a} $? 1 "ping local, device bind"
+		log_test_addr ${a} $? 2 "ping local, device bind"
 	done
 
 	#
@@ -810,9 +838,15 @@ ipv4_ping()
 	setup
 	set_sysctl net.ipv4.raw_l3mdev_accept=1 2>/dev/null
 	ipv4_ping_novrf
+	setup
+	set_sysctl net.ipv4.ping_group_range='0 2147483647' 2>/dev/null
+	ipv4_ping_novrf
 
 	log_subsection "With VRF"
 	setup "yes"
+	ipv4_ping_vrf
+	setup "yes"
+	set_sysctl net.ipv4.ping_group_range='0 2147483647' 2>/dev/null
 	ipv4_ping_vrf
 }
 
@@ -1085,6 +1119,59 @@ test_ipv4_md5_vrf__global_server__bind_ifindex0()
 	set_sysctl net.ipv4.tcp_l3mdev_accept="$old_tcp_l3mdev_accept"
 }
 
+ipv4_tcp_dontroute()
+{
+	local syncookies=$1
+	local nsa_syncookies
+	local nsb_syncookies
+	local a
+
+	#
+	# Link local connection tests (SO_DONTROUTE).
+	# Connections should succeed only when the remote IP address is
+	# on link (doesn't need to be routed through a gateway).
+	#
+
+	nsa_syncookies=$(ip netns exec "${NSA}" sysctl -n net.ipv4.tcp_syncookies)
+	nsb_syncookies=$(ip netns exec "${NSB}" sysctl -n net.ipv4.tcp_syncookies)
+	ip netns exec "${NSA}" sysctl -wq net.ipv4.tcp_syncookies=${syncookies}
+	ip netns exec "${NSB}" sysctl -wq net.ipv4.tcp_syncookies=${syncookies}
+
+	# Test with eth1 address (on link).
+
+	a=${NSB_IP}
+	log_start
+	do_run_cmd nettest -B -N "${NSA}" -O "${NSB}" -r ${a} --client-dontroute
+	log_test_addr ${a} $? 0 "SO_DONTROUTE client, syncookies=${syncookies}"
+
+	a=${NSB_IP}
+	log_start
+	do_run_cmd nettest -B -N "${NSA}" -O "${NSB}" -r ${a} --server-dontroute
+	log_test_addr ${a} $? 0 "SO_DONTROUTE server, syncookies=${syncookies}"
+
+	# Test with loopback address (routed).
+	#
+	# The client would use the eth1 address as source IP by default.
+	# Therefore, we need to use the -c option here, to force the use of the
+	# routed (loopback) address as source IP (so that the server will try
+	# to respond to a routed address and not a link local one).
+
+	a=${NSB_LO_IP}
+	log_start
+	show_hint "Should fail 'Network is unreachable' since server is not on link"
+	do_run_cmd nettest -B -N "${NSA}" -O "${NSB}" -c "${NSA_LO_IP}" -r ${a} --client-dontroute
+	log_test_addr ${a} $? 1 "SO_DONTROUTE client, syncookies=${syncookies}"
+
+	a=${NSB_LO_IP}
+	log_start
+	show_hint "Should timeout since server cannot respond (client is not on link)"
+	do_run_cmd nettest -B -N "${NSA}" -O "${NSB}" -c "${NSA_LO_IP}" -r ${a} --server-dontroute
+	log_test_addr ${a} $? 2 "SO_DONTROUTE server, syncookies=${syncookies}"
+
+	ip netns exec "${NSB}" sysctl -wq net.ipv4.tcp_syncookies=${nsb_syncookies}
+	ip netns exec "${NSA}" sysctl -wq net.ipv4.tcp_syncookies=${nsa_syncookies}
+}
+
 ipv4_tcp_novrf()
 {
 	local a
@@ -1203,7 +1290,10 @@ ipv4_tcp_novrf()
 	run_cmd nettest -d ${NSA_DEV} -r ${a}
 	log_test_addr ${a} $? 1 "No server, device client, local conn"
 
-	ipv4_tcp_md5_novrf
+	[ "$fips_enabled" = "1" ] || ipv4_tcp_md5_novrf
+
+	ipv4_tcp_dontroute 0
+	ipv4_tcp_dontroute 2
 }
 
 ipv4_tcp_vrf()
@@ -1257,9 +1347,11 @@ ipv4_tcp_vrf()
 	log_test_addr ${a} $? 1 "Global server, local connection"
 
 	# run MD5 tests
-	setup_vrf_dup
-	ipv4_tcp_md5
-	cleanup_vrf_dup
+	if [ "$fips_enabled" = "0" ]; then
+		setup_vrf_dup
+		ipv4_tcp_md5
+		cleanup_vrf_dup
+	fi
 
 	#
 	# enable VRF global server
@@ -1454,6 +1546,13 @@ ipv4_udp_novrf()
 		log_test_addr ${a} $? 0 "Client, device bind via IP_UNICAST_IF"
 
 		log_start
+		run_cmd_nsb nettest -D -s &
+		sleep 1
+		run_cmd nettest -D -r ${a} -d ${NSA_DEV} -S -0 ${NSA_IP} -U
+		log_test_addr ${a} $? 0 "Client, device bind via IP_UNICAST_IF, with connect()"
+
+
+		log_start
 		show_hint "Should fail 'Connection refused'"
 		run_cmd nettest -D -r ${a}
 		log_test_addr ${a} $? 1 "No server, unbound client"
@@ -1512,6 +1611,13 @@ ipv4_udp_novrf()
 	run_cmd nettest -D -d ${NSA_DEV} -S -r ${a}
 	log_test_addr ${a} $? 0 "Global server, device client via IP_UNICAST_IF, local connection"
 
+	log_start
+	run_cmd nettest -s -D &
+	sleep 1
+	run_cmd nettest -D -d ${NSA_DEV} -S -r ${a} -U
+	log_test_addr ${a} $? 0 "Global server, device client via IP_UNICAST_IF, local connection, with connect()"
+
+
 	# IPv4 with device bind has really weird behavior - it overrides the
 	# fib lookup, generates an rtable and tries to send the packet. This
 	# causes failures for local traffic at different places
@@ -1537,6 +1643,15 @@ ipv4_udp_novrf()
 		sleep 1
 		run_cmd nettest -D -r ${a} -d ${NSA_DEV} -S
 		log_test_addr ${a} $? 1 "Global server, device client via IP_UNICAST_IF, local connection"
+
+		log_start
+		show_hint "Should fail since addresses on loopback are out of device scope"
+		run_cmd nettest -D -s &
+		sleep 1
+		run_cmd nettest -D -r ${a} -d ${NSA_DEV} -S -U
+		log_test_addr ${a} $? 1 "Global server, device client via IP_UNICAST_IF, local connection, with connect()"
+
+
 	done
 
 	a=${NSA_IP}
@@ -1549,6 +1664,23 @@ ipv4_udp_novrf()
 	log_start
 	run_cmd nettest -D -d ${NSA_DEV} -r ${a}
 	log_test_addr ${a} $? 2 "No server, device client, local conn"
+
+	#
+	# Link local connection tests (SO_DONTROUTE).
+	# Connections should succeed only when the remote IP address is
+	# on link (doesn't need to be routed through a gateway).
+	#
+
+	a=${NSB_IP}
+	log_start
+	do_run_cmd nettest -B -D -N "${NSA}" -O "${NSB}" -r ${a} --client-dontroute
+	log_test_addr ${a} $? 0 "SO_DONTROUTE client"
+
+	a=${NSB_LO_IP}
+	log_start
+	show_hint "Should fail 'Network is unreachable' since server is not on link"
+	do_run_cmd nettest -B -D -N "${NSA}" -O "${NSB}" -r ${a} --client-dontroute
+	log_test_addr ${a} $? 1 "SO_DONTROUTE client"
 }
 
 ipv4_udp_vrf()
@@ -1787,12 +1919,33 @@ ipv4_addr_bind_novrf()
 	done
 
 	#
-	# raw socket with nonlocal bind
+	# tests for nonlocal bind
 	#
 	a=${NL_IP}
 	log_start
-	run_cmd nettest -s -R -P icmp -f -l ${a} -I ${NSA_DEV} -b
-	log_test_addr ${a} $? 0 "Raw socket bind to nonlocal address after device bind"
+	run_cmd nettest -s -R -f -l ${a} -b
+	log_test_addr ${a} $? 0 "Raw socket bind to nonlocal address"
+
+	log_start
+	run_cmd nettest -s -f -l ${a} -b
+	log_test_addr ${a} $? 0 "TCP socket bind to nonlocal address"
+
+	log_start
+	run_cmd nettest -s -D -P icmp -f -l ${a} -b
+	log_test_addr ${a} $? 0 "ICMP socket bind to nonlocal address"
+
+	#
+	# check that ICMP sockets cannot bind to broadcast and multicast addresses
+	#
+	a=${BCAST_IP}
+	log_start
+	run_cmd nettest -s -D -P icmp -l ${a} -b
+	log_test_addr ${a} $? 1 "ICMP socket bind to broadcast address"
+
+	a=${MCAST_IP}
+	log_start
+	run_cmd nettest -s -D -P icmp -l ${a} -b
+	log_test_addr ${a} $? 1 "ICMP socket bind to multicast address"
 
 	#
 	# tcp sockets
@@ -1844,12 +1997,33 @@ ipv4_addr_bind_vrf()
 	log_test_addr ${a} $? 1 "Raw socket bind to out of scope address after VRF bind"
 
 	#
-	# raw socket with nonlocal bind
+	# tests for nonlocal bind
 	#
 	a=${NL_IP}
 	log_start
-	run_cmd nettest -s -R -P icmp -f -l ${a} -I ${VRF} -b
+	run_cmd nettest -s -R -f -l ${a} -I ${VRF} -b
 	log_test_addr ${a} $? 0 "Raw socket bind to nonlocal address after VRF bind"
+
+	log_start
+	run_cmd nettest -s -f -l ${a} -I ${VRF} -b
+	log_test_addr ${a} $? 0 "TCP socket bind to nonlocal address after VRF bind"
+
+	log_start
+	run_cmd nettest -s -D -P icmp -f -l ${a} -I ${VRF} -b
+	log_test_addr ${a} $? 0 "ICMP socket bind to nonlocal address after VRF bind"
+
+	#
+	# check that ICMP sockets cannot bind to broadcast and multicast addresses
+	#
+	a=${BCAST_IP}
+	log_start
+	run_cmd nettest -s -D -P icmp -l ${a} -I ${VRF} -b
+	log_test_addr ${a} $? 1 "ICMP socket bind to broadcast address after VRF bind"
+
+	a=${MCAST_IP}
+	log_start
+	run_cmd nettest -s -D -P icmp -l ${a} -I ${VRF} -b
+	log_test_addr ${a} $? 1 "ICMP socket bind to multicast address after VRF bind"
 
 	#
 	# tcp sockets
@@ -1883,10 +2057,12 @@ ipv4_addr_bind()
 
 	log_subsection "No VRF"
 	setup
+	set_sysctl net.ipv4.ping_group_range='0 2147483647' 2>/dev/null
 	ipv4_addr_bind_novrf
 
 	log_subsection "With VRF"
 	setup "yes"
+	set_sysctl net.ipv4.ping_group_range='0 2147483647' 2>/dev/null
 	ipv4_addr_bind_vrf
 }
 
@@ -2348,9 +2524,15 @@ ipv6_ping()
 	log_subsection "No VRF"
 	setup
 	ipv6_ping_novrf
+	setup
+	set_sysctl net.ipv4.ping_group_range='0 2147483647' 2>/dev/null
+	ipv6_ping_novrf
 
 	log_subsection "With VRF"
 	setup "yes"
+	ipv6_ping_vrf
+	setup "yes"
+	set_sysctl net.ipv4.ping_group_range='0 2147483647' 2>/dev/null
 	ipv6_ping_vrf
 }
 
@@ -2686,7 +2868,7 @@ ipv6_tcp_novrf()
 		log_test_addr ${a} $? 1 "No server, device client, local conn"
 	done
 
-	ipv6_tcp_md5_novrf
+	[ "$fips_enabled" = "1" ] || ipv6_tcp_md5_novrf
 }
 
 ipv6_tcp_vrf()
@@ -2756,9 +2938,11 @@ ipv6_tcp_vrf()
 	log_test_addr ${a} $? 1 "Global server, local connection"
 
 	# run MD5 tests
-	setup_vrf_dup
-	ipv6_tcp_md5
-	cleanup_vrf_dup
+	if [ "$fips_enabled" = "0" ]; then
+		setup_vrf_dup
+		ipv6_tcp_md5
+		cleanup_vrf_dup
+	fi
 
 	#
 	# enable VRF global server
@@ -3094,6 +3278,13 @@ ipv6_udp_novrf()
 		sleep 1
 		run_cmd nettest -6 -D -r ${a} -d ${NSA_DEV} -S
 		log_test_addr ${a} $? 1 "Global server, device client via IP_UNICAST_IF, local connection"
+
+		log_start
+		show_hint "Should fail 'No route to host' since addresses on loopback are out of device scope"
+		run_cmd nettest -6 -D -s &
+		sleep 1
+		run_cmd nettest -6 -D -r ${a} -d ${NSA_DEV} -S -U
+		log_test_addr ${a} $? 1 "Global server, device client via IP_UNICAST_IF, local connection, with connect()"
 	done
 
 	a=${NSA_IP6}
@@ -4103,10 +4294,13 @@ elif [ "$TESTS" = "ipv6" ]; then
 	TESTS="$TESTS_IPV6"
 fi
 
-which nettest >/dev/null
-if [ $? -ne 0 ]; then
-	echo "'nettest' command not found; skipping tests"
-	exit $ksft_skip
+# nettest can be run from PATH or from same directory as this selftest
+if ! which nettest >/dev/null; then
+	PATH=$PWD:$PATH
+	if ! which nettest >/dev/null; then
+		echo "'nettest' command not found; skipping tests"
+		exit $ksft_skip
+	fi
 fi
 
 declare -i nfail=0

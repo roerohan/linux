@@ -17,6 +17,8 @@
 #include "xfs_itable.h"
 #include "xfs_fsops.h"
 #include "xfs_rtalloc.h"
+#include "xfs_da_format.h"
+#include "xfs_da_btree.h"
 #include "xfs_attr.h"
 #include "xfs_ioctl.h"
 #include "xfs_ioctl32.h"
@@ -202,7 +204,7 @@ xfs_compat_ioc_fsbulkstat(
 	struct xfs_fsop_bulkreq	bulkreq;
 	struct xfs_ibulk	breq = {
 		.mp		= mp,
-		.mnt_userns	= file_mnt_user_ns(file),
+		.idmap		= file_mnt_idmap(file),
 		.ocount		= 0,
 	};
 	xfs_ino_t		lastino;
@@ -217,7 +219,7 @@ xfs_compat_ioc_fsbulkstat(
 	inumbers_fmt_pf		inumbers_func = xfs_fsinumbers_fmt_compat;
 	bulkstat_one_fmt_pf	bs_one_func = xfs_fsbulkstat_one_fmt_compat;
 
-#ifdef CONFIG_X86_X32
+#ifdef CONFIG_X86_X32_ABI
 	if (in_x32_syscall()) {
 		/*
 		 * ... but on x32 the input xfs_fsop_bulkreq has pointers

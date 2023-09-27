@@ -20,27 +20,45 @@
 #include <linux/serdev.h>
 #include "tty.h"
 
-static int tty_port_default_receive_buf(struct tty_port *port,
-					const unsigned char *p,
-					const unsigned char *f, size_t count)
+static size_t tty_port_default_receive_buf(struct tty_port *port, const u8 *p,
+					   const u8 *f, size_t count)
 {
-	int ret;
 	struct tty_struct *tty;
-	struct tty_ldisc *disc;
+	struct tty_ldisc *ld;
 
 	tty = READ_ONCE(port->itty);
 	if (!tty)
 		return 0;
 
-	disc = tty_ldisc_ref(tty);
-	if (!disc)
+	ld = tty_ldisc_ref(tty);
+	if (!ld)
 		return 0;
 
-	ret = tty_ldisc_receive_buf(disc, p, (char *)f, count);
+	count = tty_ldisc_receive_buf(ld, p, f, count);
 
-	tty_ldisc_deref(disc);
+	tty_ldisc_deref(ld);
 
-	return ret;
+	return count;
+}
+
+static void tty_port_default_lookahead_buf(struct tty_port *port, const u8 *p,
+					   const u8 *f, size_t count)
+{
+	struct tty_struct *tty;
+	struct tty_ldisc *ld;
+
+	tty = READ_ONCE(port->itty);
+	if (!tty)
+		return;
+
+	ld = tty_ldisc_ref(tty);
+	if (!ld)
+		return;
+
+	if (ld->ops->lookahead_buf)
+		ld->ops->lookahead_buf(ld->tty, p, f, count);
+
+	tty_ldisc_deref(ld);
 }
 
 static void tty_port_default_wakeup(struct tty_port *port)
@@ -55,6 +73,7 @@ static void tty_port_default_wakeup(struct tty_port *port)
 
 const struct tty_port_client_operations tty_port_default_client_ops = {
 	.receive_buf = tty_port_default_receive_buf,
+	.lookahead_buf = tty_port_default_lookahead_buf,
 	.write_wakeup = tty_port_default_wakeup,
 };
 EXPORT_SYMBOL_GPL(tty_port_default_client_ops);
@@ -225,8 +244,11 @@ int tty_port_alloc_xmit_buf(struct tty_port *port)
 {
 	/* We may sleep in get_zeroed_page() */
 	mutex_lock(&port->buf_mutex);
-	if (port->xmit_buf == NULL)
+	if (port->xmit_buf == NULL) {
 		port->xmit_buf = (unsigned char *)get_zeroed_page(GFP_KERNEL);
+		if (port->xmit_buf)
+			kfifo_init(&port->xmit_fifo, port->xmit_buf, PAGE_SIZE);
+	}
 	mutex_unlock(&port->buf_mutex);
 	if (port->xmit_buf == NULL)
 		return -ENOMEM;
@@ -237,10 +259,9 @@ EXPORT_SYMBOL(tty_port_alloc_xmit_buf);
 void tty_port_free_xmit_buf(struct tty_port *port)
 {
 	mutex_lock(&port->buf_mutex);
-	if (port->xmit_buf != NULL) {
-		free_page((unsigned long)port->xmit_buf);
-		port->xmit_buf = NULL;
-	}
+	free_page((unsigned long)port->xmit_buf);
+	port->xmit_buf = NULL;
+	INIT_KFIFO(port->xmit_fifo);
 	mutex_unlock(&port->buf_mutex);
 }
 EXPORT_SYMBOL(tty_port_free_xmit_buf);
@@ -267,8 +288,7 @@ static void tty_port_destructor(struct kref *kref)
 	/* check if last port ref was dropped before tty release */
 	if (WARN_ON(port->itty))
 		return;
-	if (port->xmit_buf)
-		free_page((unsigned long)port->xmit_buf);
+	free_page((unsigned long)port->xmit_buf);
 	tty_port_destroy(port);
 	if (port->ops && port->ops->destruct)
 		port->ops->destruct(port);
@@ -345,7 +365,7 @@ static void tty_port_shutdown(struct tty_port *port, struct tty_struct *tty)
 		goto out;
 
 	if (tty_port_initialized(port)) {
-		tty_port_set_initialized(port, 0);
+		tty_port_set_initialized(port, false);
 		/*
 		 * Drop DTR/RTS if HUPCL is set. This causes any attached
 		 * modem to hang up the line.
@@ -381,7 +401,7 @@ void tty_port_hangup(struct tty_port *port)
 		set_bit(TTY_IO_ERROR, &tty->flags);
 	port->tty = NULL;
 	spin_unlock_irqrestore(&port->lock, flags);
-	tty_port_set_active(port, 0);
+	tty_port_set_active(port, false);
 	tty_port_shutdown(port, tty);
 	tty_kref_put(tty);
 	wake_up_interruptible(&port->open_wait);
@@ -422,10 +442,10 @@ EXPORT_SYMBOL_GPL(tty_port_tty_wakeup);
  * to hide some internal details. This will eventually become entirely
  * internal to the tty port.
  */
-int tty_port_carrier_raised(struct tty_port *port)
+bool tty_port_carrier_raised(struct tty_port *port)
 {
 	if (port->ops->carrier_raised == NULL)
-		return 1;
+		return true;
 	return port->ops->carrier_raised(port);
 }
 EXPORT_SYMBOL(tty_port_carrier_raised);
@@ -441,7 +461,7 @@ EXPORT_SYMBOL(tty_port_carrier_raised);
 void tty_port_raise_dtr_rts(struct tty_port *port)
 {
 	if (port->ops->dtr_rts)
-		port->ops->dtr_rts(port, 1);
+		port->ops->dtr_rts(port, true);
 }
 EXPORT_SYMBOL(tty_port_raise_dtr_rts);
 
@@ -456,7 +476,7 @@ EXPORT_SYMBOL(tty_port_raise_dtr_rts);
 void tty_port_lower_dtr_rts(struct tty_port *port)
 {
 	if (port->ops->dtr_rts)
-		port->ops->dtr_rts(port, 0);
+		port->ops->dtr_rts(port, false);
 }
 EXPORT_SYMBOL(tty_port_lower_dtr_rts);
 
@@ -496,14 +516,14 @@ int tty_port_block_til_ready(struct tty_port *port,
 	 * the port has just hung up or is in another error state.
 	 */
 	if (tty_io_error(tty)) {
-		tty_port_set_active(port, 1);
+		tty_port_set_active(port, true);
 		return 0;
 	}
 	if (filp == NULL || (filp->f_flags & O_NONBLOCK)) {
 		/* Indicate we are open */
 		if (C_BAUD(tty))
 			tty_port_raise_dtr_rts(port);
-		tty_port_set_active(port, 1);
+		tty_port_set_active(port, true);
 		return 0;
 	}
 
@@ -566,7 +586,7 @@ int tty_port_block_til_ready(struct tty_port *port,
 	port->blocked_open--;
 	spin_unlock_irqrestore(&port->lock, flags);
 	if (retval == 0)
-		tty_port_set_active(port, 1);
+		tty_port_set_active(port, true);
 	return retval;
 }
 EXPORT_SYMBOL(tty_port_block_til_ready);
@@ -673,7 +693,7 @@ void tty_port_close_end(struct tty_port *port, struct tty_struct *tty)
 		wake_up_interruptible(&port->open_wait);
 	}
 	spin_unlock_irqrestore(&port->lock, flags);
-	tty_port_set_active(port, 0);
+	tty_port_set_active(port, false);
 }
 EXPORT_SYMBOL(tty_port_close_end);
 
@@ -732,6 +752,9 @@ EXPORT_SYMBOL_GPL(tty_port_install);
  * the device to be ready using tty_port_block_til_ready() (e.g.  raises
  * DTR/CTS and waits for carrier).
  *
+ * Note that @port->ops->shutdown is not called when @port->ops->activate
+ * returns an error (on the contrary, @tty->ops->close is).
+ *
  * Locking: Caller holds tty lock.
  *
  * Note: may drop and reacquire tty lock (in tty_port_block_til_ready()) so
@@ -763,7 +786,7 @@ int tty_port_open(struct tty_port *port, struct tty_struct *tty,
 				return retval;
 			}
 		}
-		tty_port_set_initialized(port, 1);
+		tty_port_set_initialized(port, true);
 	}
 	mutex_unlock(&port->mutex);
 	return tty_port_block_til_ready(port, tty, filp);

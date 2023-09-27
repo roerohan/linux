@@ -18,8 +18,10 @@
 #include <linux/errno.h>
 #include <asm/types.h>
 #include <asm/byteorder.h>
-#include <linux/uaccess.h>
 #include <asm/checksum.h>
+#if !defined(_HAVE_ARCH_COPY_AND_CSUM_FROM_USER) || !defined(HAVE_CSUM_COPY_USER)
+#include <linux/uaccess.h>
+#endif
 
 #ifndef _HAVE_ARCH_COPY_AND_CSUM_FROM_USER
 static __always_inline
@@ -80,6 +82,7 @@ static __always_inline __sum16 csum16_sub(__sum16 csum, __be16 addend)
 	return csum16_add(csum, ~addend);
 }
 
+#ifndef HAVE_ARCH_CSUM_SHIFT
 static __always_inline __wsum csum_shift(__wsum sum, int offset)
 {
 	/* rotate sum to align it with a 16b boundary */
@@ -87,6 +90,7 @@ static __always_inline __wsum csum_shift(__wsum sum, int offset)
 		return (__force __wsum)ror32((__force u32)sum, 8);
 	return sum;
 }
+#endif
 
 static __always_inline __wsum
 csum_block_add(__wsum csum, __wsum csum2, int offset)

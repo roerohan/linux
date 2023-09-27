@@ -40,7 +40,7 @@ static void nft_fwd_netdev_eval(const struct nft_expr *expr,
 static const struct nla_policy nft_fwd_netdev_policy[NFTA_FWD_MAX + 1] = {
 	[NFTA_FWD_SREG_DEV]	= { .type = NLA_U32 },
 	[NFTA_FWD_SREG_ADDR]	= { .type = NLA_U32 },
-	[NFTA_FWD_NFPROTO]	= { .type = NLA_U32 },
+	[NFTA_FWD_NFPROTO]	= NLA_POLICY_MAX(NLA_BE32, 255),
 };
 
 static int nft_fwd_netdev_init(const struct nft_ctx *ctx,
@@ -56,7 +56,8 @@ static int nft_fwd_netdev_init(const struct nft_ctx *ctx,
 				       sizeof(int));
 }
 
-static int nft_fwd_netdev_dump(struct sk_buff *skb, const struct nft_expr *expr)
+static int nft_fwd_netdev_dump(struct sk_buff *skb,
+			       const struct nft_expr *expr, bool reset)
 {
 	struct nft_fwd_netdev *priv = nft_expr_priv(expr);
 
@@ -145,7 +146,7 @@ static void nft_fwd_neigh_eval(const struct nft_expr *expr,
 		return;
 
 	skb->dev = dev;
-	skb->tstamp = 0;
+	skb_clear_tstamp(skb);
 	neigh_xmit(neigh_table, dev, addr, skb);
 out:
 	regs->verdict.code = verdict;
@@ -186,7 +187,8 @@ static int nft_fwd_neigh_init(const struct nft_ctx *ctx,
 				       addr_len);
 }
 
-static int nft_fwd_neigh_dump(struct sk_buff *skb, const struct nft_expr *expr)
+static int nft_fwd_neigh_dump(struct sk_buff *skb,
+			      const struct nft_expr *expr, bool reset)
 {
 	struct nft_fwd_neigh *priv = nft_expr_priv(expr);
 
@@ -217,6 +219,7 @@ static const struct nft_expr_ops nft_fwd_neigh_netdev_ops = {
 	.init		= nft_fwd_neigh_init,
 	.dump		= nft_fwd_neigh_dump,
 	.validate	= nft_fwd_validate,
+	.reduce		= NFT_REDUCE_READONLY,
 };
 
 static const struct nft_expr_ops nft_fwd_netdev_ops = {
@@ -226,6 +229,7 @@ static const struct nft_expr_ops nft_fwd_netdev_ops = {
 	.init		= nft_fwd_netdev_init,
 	.dump		= nft_fwd_netdev_dump,
 	.validate	= nft_fwd_validate,
+	.reduce		= NFT_REDUCE_READONLY,
 	.offload	= nft_fwd_netdev_offload,
 	.offload_action	= nft_fwd_netdev_offload_action,
 };

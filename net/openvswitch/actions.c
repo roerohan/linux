@@ -17,6 +17,7 @@
 #include <linux/if_vlan.h>
 
 #include <net/dst.h>
+#include <net/gso.h>
 #include <net/ip.h>
 #include <net/ipv6.h>
 #include <net/ip6_fib.h>
@@ -26,6 +27,7 @@
 #include <net/sctp/checksum.h>
 
 #include "datapath.h"
+#include "drop.h"
 #include "flow.h"
 #include "conntrack.h"
 #include "vport.h"
@@ -373,6 +375,7 @@ static void set_ip_addr(struct sk_buff *skb, struct iphdr *nh,
 	update_ip_l4_checksum(skb, nh, *addr, new_addr);
 	csum_replace4(&nh->check, *addr, new_addr);
 	skb_clear_hash(skb);
+	ovs_ct_clear(skb, NULL);
 	*addr = new_addr;
 }
 
@@ -420,6 +423,7 @@ static void set_ipv6_addr(struct sk_buff *skb, u8 l4_proto,
 		update_ipv6_checksum(skb, l4_proto, addr, new_addr);
 
 	skb_clear_hash(skb);
+	ovs_ct_clear(skb, NULL);
 	memcpy(addr, new_addr, sizeof(__be32[4]));
 }
 
@@ -660,6 +664,7 @@ static int set_nsh(struct sk_buff *skb, struct sw_flow_key *flow_key,
 static void set_tp_port(struct sk_buff *skb, __be16 *port,
 			__be16 new_port, __sum16 *check)
 {
+	ovs_ct_clear(skb, NULL);
 	inet_proto_csum_replace2(check, skb, *port, new_port, false);
 	*port = new_port;
 }
@@ -699,6 +704,7 @@ static int set_udp(struct sk_buff *skb, struct sw_flow_key *flow_key,
 		uh->dest = dst;
 		flow_key->tp.src = src;
 		flow_key->tp.dst = dst;
+		ovs_ct_clear(skb, NULL);
 	}
 
 	skb_clear_hash(skb);
@@ -761,6 +767,8 @@ static int set_sctp(struct sk_buff *skb, struct sw_flow_key *flow_key,
 	sh->checksum = old_csum ^ old_correct_csum ^ new_csum;
 
 	skb_clear_hash(skb);
+	ovs_ct_clear(skb, NULL);
+
 	flow_key->tp.src = sh->source;
 	flow_key->tp.dst = sh->dest;
 
@@ -774,7 +782,7 @@ static int ovs_vport_output(struct net *net, struct sock *sk,
 	struct vport *vport = data->vport;
 
 	if (skb_cow_head(skb, data->l2_len) < 0) {
-		kfree_skb(skb);
+		kfree_skb_reason(skb, SKB_DROP_REASON_NOMEM);
 		return -ENOMEM;
 	}
 
@@ -845,6 +853,7 @@ static void ovs_fragment(struct net *net, struct vport *vport,
 			 struct sk_buff *skb, u16 mru,
 			 struct sw_flow_key *key)
 {
+	enum ovs_drop_reason reason;
 	u16 orig_network_offset = 0;
 
 	if (eth_p_mpls(skb->protocol)) {
@@ -854,6 +863,7 @@ static void ovs_fragment(struct net *net, struct vport *vport,
 
 	if (skb_network_offset(skb) > MAX_L2_LEN) {
 		OVS_NLERR(1, "L2 header too long to fragment");
+		reason = OVS_DROP_FRAG_L2_TOO_LONG;
 		goto err;
 	}
 
@@ -894,12 +904,13 @@ static void ovs_fragment(struct net *net, struct vport *vport,
 		WARN_ONCE(1, "Failed fragment ->%s: eth=%04x, MRU=%d, MTU=%d.",
 			  ovs_vport_name(vport), ntohs(key->eth.type), mru,
 			  vport->dev->mtu);
+		reason = OVS_DROP_FRAG_INVALID_PROTO;
 		goto err;
 	}
 
 	return;
 err:
-	kfree_skb(skb);
+	ovs_kfree_skb_reason(skb, reason);
 }
 
 static void do_output(struct datapath *dp, struct sk_buff *skb, int out_port,
@@ -907,7 +918,7 @@ static void do_output(struct datapath *dp, struct sk_buff *skb, int out_port,
 {
 	struct vport *vport = ovs_vport_rcu(dp, out_port);
 
-	if (likely(vport)) {
+	if (likely(vport && netif_carrier_ok(vport->dev))) {
 		u16 mru = OVS_CB(skb)->mru;
 		u32 cutlen = OVS_CB(skb)->cutlen;
 
@@ -926,10 +937,10 @@ static void do_output(struct datapath *dp, struct sk_buff *skb, int out_port,
 
 			ovs_fragment(net, vport, skb, mru, key);
 		} else {
-			kfree_skb(skb);
+			kfree_skb_reason(skb, SKB_DROP_REASON_PKT_TOO_BIG);
 		}
 	} else {
-		kfree_skb(skb);
+		kfree_skb_reason(skb, SKB_DROP_REASON_DEV_READY);
 	}
 }
 
@@ -1003,7 +1014,7 @@ static int dec_ttl_exception_handler(struct datapath *dp, struct sk_buff *skb,
 		return clone_execute(dp, skb, key, 0, nla_data(actions),
 				     nla_len(actions), true, false);
 
-	consume_skb(skb);
+	ovs_kfree_skb_reason(skb, OVS_DROP_IP_TTL);
 	return 0;
 }
 
@@ -1027,9 +1038,9 @@ static int sample(struct datapath *dp, struct sk_buff *skb,
 	actions = nla_next(sample_arg, &rem);
 
 	if ((arg->probability != U32_MAX) &&
-	    (!arg->probability || prandom_u32() > arg->probability)) {
+	    (!arg->probability || get_random_u32() > arg->probability)) {
 		if (last)
-			consume_skb(skb);
+			ovs_kfree_skb_reason(skb, OVS_DROP_LAST_ACTION);
 		return 0;
 	}
 
@@ -1051,7 +1062,7 @@ static int clone(struct datapath *dp, struct sk_buff *skb,
 	int rem = nla_len(attr);
 	bool dont_clone_flow_key;
 
-	/* The first action is always 'OVS_CLONE_ATTR_ARG'. */
+	/* The first action is always 'OVS_CLONE_ATTR_EXEC'. */
 	clone_arg = nla_data(attr);
 	dont_clone_flow_key = nla_get_u32(clone_arg);
 	actions = nla_next(clone_arg, &rem);
@@ -1066,8 +1077,16 @@ static void execute_hash(struct sk_buff *skb, struct sw_flow_key *key,
 	struct ovs_action_hash *hash_act = nla_data(attr);
 	u32 hash = 0;
 
-	/* OVS_HASH_ALG_L4 is the only possible hash algorithm.  */
-	hash = skb_get_hash(skb);
+	if (hash_act->hash_alg == OVS_HASH_ALG_L4) {
+		/* OVS_HASH_ALG_L4 hasing type. */
+		hash = skb_get_hash(skb);
+	} else if (hash_act->hash_alg == OVS_HASH_ALG_SYM_L4) {
+		/* OVS_HASH_ALG_SYM_L4 hashing type.  NOTE: this doesn't
+		 * extend past an encapsulated header.
+		 */
+		hash = __skb_get_hash_symmetric(skb);
+	}
+
 	hash = jhash_1word(hash, hash_act->hash_basis);
 	if (!hash)
 		hash = 0x1;
@@ -1282,6 +1301,9 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
 		if (trace_ovs_do_execute_action_enabled())
 			trace_ovs_do_execute_action(dp, skb, key, a, rem);
 
+		/* Actions that rightfully have to consume the skb should do it
+		 * and return directly.
+		 */
 		switch (nla_type(a)) {
 		case OVS_ACTION_ATTR_OUTPUT: {
 			int port = nla_get_u32(a);
@@ -1317,6 +1339,10 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
 			output_userspace(dp, skb, key, a, attr,
 						     len, OVS_CB(skb)->cutlen);
 			OVS_CB(skb)->cutlen = 0;
+			if (nla_is_last(a, rem)) {
+				consume_skb(skb);
+				return 0;
+			}
 			break;
 
 		case OVS_ACTION_ATTR_HASH:
@@ -1431,7 +1457,7 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
 
 		case OVS_ACTION_ATTR_METER:
 			if (ovs_meter_execute(dp, skb, key, nla_get_u32(a))) {
-				consume_skb(skb);
+				ovs_kfree_skb_reason(skb, OVS_DROP_METER);
 				return 0;
 			}
 			break;
@@ -1462,15 +1488,24 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
 				return dec_ttl_exception_handler(dp, skb,
 								 key, a);
 			break;
+
+		case OVS_ACTION_ATTR_DROP: {
+			enum ovs_drop_reason reason = nla_get_u32(a)
+				? OVS_DROP_EXPLICIT_WITH_ERROR
+				: OVS_DROP_EXPLICIT;
+
+			ovs_kfree_skb_reason(skb, reason);
+			return 0;
+		}
 		}
 
 		if (unlikely(err)) {
-			kfree_skb(skb);
+			ovs_kfree_skb_reason(skb, OVS_DROP_ACTION_ERROR);
 			return err;
 		}
 	}
 
-	consume_skb(skb);
+	ovs_kfree_skb_reason(skb, OVS_DROP_LAST_ACTION);
 	return 0;
 }
 
@@ -1532,15 +1567,15 @@ static int clone_execute(struct datapath *dp, struct sk_buff *skb,
 		/* Out of per CPU action FIFO space. Drop the 'skb' and
 		 * log an error.
 		 */
-		kfree_skb(skb);
+		ovs_kfree_skb_reason(skb, OVS_DROP_DEFERRED_LIMIT);
 
 		if (net_ratelimit()) {
 			if (actions) { /* Sample action */
 				pr_warn("%s: deferred action limit reached, drop sample action\n",
 					ovs_dp_name(dp));
 			} else {  /* Recirc action */
-				pr_warn("%s: deferred action limit reached, drop recirc action\n",
-					ovs_dp_name(dp));
+				pr_warn("%s: deferred action limit reached, drop recirc action (recirc_id=%#x)\n",
+					ovs_dp_name(dp), recirc_id);
 			}
 		}
 	}
@@ -1584,7 +1619,7 @@ int ovs_execute_actions(struct datapath *dp, struct sk_buff *skb,
 	if (unlikely(level > OVS_RECURSION_LIMIT)) {
 		net_crit_ratelimited("ovs: recursion limit reached on datapath %s, probable configuration error\n",
 				     ovs_dp_name(dp));
-		kfree_skb(skb);
+		ovs_kfree_skb_reason(skb, OVS_DROP_RECURSION_LIMIT);
 		err = -ENETDOWN;
 		goto out;
 	}

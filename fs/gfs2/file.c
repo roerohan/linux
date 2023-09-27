@@ -15,6 +15,7 @@
 #include <linux/mm.h>
 #include <linux/mount.h>
 #include <linux/fs.h>
+#include <linux/filelock.h>
 #include <linux/gfs2_ondisk.h>
 #include <linux/falloc.h>
 #include <linux/swap.h>
@@ -235,7 +236,7 @@ static int do_gfs2_set_flags(struct inode *inode, u32 reqflags, u32 mask)
 		goto out;
 
 	if (!IS_IMMUTABLE(inode)) {
-		error = gfs2_permission(&init_user_ns, inode, MAY_WRITE);
+		error = gfs2_permission(&nop_mnt_idmap, inode, MAY_WRITE);
 		if (error)
 			goto out;
 	}
@@ -259,7 +260,7 @@ static int do_gfs2_set_flags(struct inode *inode, u32 reqflags, u32 mask)
 	error = gfs2_meta_inode_buffer(ip, &bh);
 	if (error)
 		goto out_trans_end;
-	inode->i_ctime = current_time(inode);
+	inode_set_ctime_current(inode);
 	gfs2_trans_add_meta(ip->i_gl, bh);
 	ip->i_diskflags = new_flags;
 	gfs2_dinode_out(ip, bh->b_data);
@@ -273,7 +274,7 @@ out:
 	return error;
 }
 
-int gfs2_fileattr_set(struct user_namespace *mnt_userns,
+int gfs2_fileattr_set(struct mnt_idmap *idmap,
 		      struct dentry *dentry, struct fileattr *fa)
 {
 	struct inode *inode = d_inode(dentry);
@@ -431,7 +432,7 @@ static vm_fault_t gfs2_page_mkwrite(struct vm_fault *vmf)
 	gfs2_holder_init(ip->i_gl, LM_ST_EXCLUSIVE, 0, &gh);
 	err = gfs2_glock_nq(&gh);
 	if (err) {
-		ret = block_page_mkwrite_return(err);
+		ret = vmf_fs_error(err);
 		goto out_uninit;
 	}
 
@@ -473,7 +474,7 @@ static vm_fault_t gfs2_page_mkwrite(struct vm_fault *vmf)
 
 	err = gfs2_rindex_update(sdp);
 	if (err) {
-		ret = block_page_mkwrite_return(err);
+		ret = vmf_fs_error(err);
 		goto out_unlock;
 	}
 
@@ -481,12 +482,12 @@ static vm_fault_t gfs2_page_mkwrite(struct vm_fault *vmf)
 	ap.target = data_blocks + ind_blocks;
 	err = gfs2_quota_lock_check(ip, &ap);
 	if (err) {
-		ret = block_page_mkwrite_return(err);
+		ret = vmf_fs_error(err);
 		goto out_unlock;
 	}
 	err = gfs2_inplace_reserve(ip, &ap);
 	if (err) {
-		ret = block_page_mkwrite_return(err);
+		ret = vmf_fs_error(err);
 		goto out_quota_unlock;
 	}
 
@@ -499,7 +500,7 @@ static vm_fault_t gfs2_page_mkwrite(struct vm_fault *vmf)
 	}
 	err = gfs2_trans_begin(sdp, rblocks, 0);
 	if (err) {
-		ret = block_page_mkwrite_return(err);
+		ret = vmf_fs_error(err);
 		goto out_trans_fail;
 	}
 
@@ -507,7 +508,7 @@ static vm_fault_t gfs2_page_mkwrite(struct vm_fault *vmf)
 	if (gfs2_is_stuffed(ip)) {
 		err = gfs2_unstuff_dinode(ip);
 		if (err) {
-			ret = block_page_mkwrite_return(err);
+			ret = vmf_fs_error(err);
 			goto out_trans_end;
 		}
 	}
@@ -523,7 +524,7 @@ static vm_fault_t gfs2_page_mkwrite(struct vm_fault *vmf)
 
 	err = gfs2_allocate_page_backing(page, length);
 	if (err)
-		ret = block_page_mkwrite_return(err);
+		ret = vmf_fs_error(err);
 
 out_page_locked:
 	if (ret != VM_FAULT_LOCKED)
@@ -557,7 +558,7 @@ static vm_fault_t gfs2_fault(struct vm_fault *vmf)
 	gfs2_holder_init(ip->i_gl, LM_ST_SHARED, 0, &gh);
 	err = gfs2_glock_nq(&gh);
 	if (err) {
-		ret = block_page_mkwrite_return(err);
+		ret = vmf_fs_error(err);
 		goto out_uninit;
 	}
 	ret = filemap_fault(vmf);
@@ -629,6 +630,9 @@ int gfs2_open_common(struct inode *inode, struct file *file)
 		ret = generic_file_open(inode, file);
 		if (ret)
 			return ret;
+
+		if (!gfs2_is_jdata(GFS2_I(inode)))
+			file->f_mode |= FMODE_CAN_ODIRECT;
 	}
 
 	fp = kzalloc(sizeof(struct gfs2_file), GFP_NOFS);
@@ -706,7 +710,7 @@ static int gfs2_release(struct inode *inode, struct file *file)
 
 	if (file->f_mode & FMODE_WRITE) {
 		if (gfs2_rs_active(&ip->i_res))
-			gfs2_rs_delete(ip, &inode->i_writecount);
+			gfs2_rs_delete(ip);
 		gfs2_qa_put(ip);
 	}
 	return 0;
@@ -770,33 +774,35 @@ static int gfs2_fsync(struct file *file, loff_t start, loff_t end,
 	return ret ? ret : ret1;
 }
 
-static inline bool should_fault_in_pages(ssize_t ret, struct iov_iter *i,
+static inline bool should_fault_in_pages(struct iov_iter *i,
+					 struct kiocb *iocb,
 					 size_t *prev_count,
 					 size_t *window_size)
 {
 	size_t count = iov_iter_count(i);
-	char __user *p;
-	int pages = 1;
+	size_t size, offs;
 
-	if (likely(!count))
+	if (!count)
 		return false;
-	if (ret <= 0 && ret != -EFAULT)
-		return false;
-	if (!iter_is_iovec(i))
+	if (!user_backed_iter(i))
 		return false;
 
-	if (*prev_count != count || !*window_size) {
-		int pages, nr_dirtied;
+	/*
+	 * Try to fault in multiple pages initially.  When that doesn't result
+	 * in any progress, fall back to a single page.
+	 */
+	size = PAGE_SIZE;
+	offs = offset_in_page(iocb->ki_pos);
+	if (*prev_count != count) {
+		size_t nr_dirtied;
 
-		pages = min_t(int, BIO_MAX_VECS, DIV_ROUND_UP(count, PAGE_SIZE));
 		nr_dirtied = max(current->nr_dirtied_pause -
-				 current->nr_dirtied, 1);
-		pages = min(pages, nr_dirtied);
+				 current->nr_dirtied, 8);
+		size = min_t(size_t, SZ_1M, nr_dirtied << PAGE_SHIFT);
 	}
 
 	*prev_count = count;
-	p = i->iov[0].iov_base + i->iov_offset;
-	*window_size = (size_t)PAGE_SIZE * pages - offset_in_page(p);
+	*window_size = size - offs;
 	return true;
 }
 
@@ -806,7 +812,7 @@ static ssize_t gfs2_file_direct_read(struct kiocb *iocb, struct iov_iter *to,
 	struct file *file = iocb->ki_filp;
 	struct gfs2_inode *ip = GFS2_I(file->f_mapping->host);
 	size_t prev_count = 0, window_size = 0;
-	size_t written = 0;
+	size_t read = 0;
 	ssize_t ret;
 
 	/*
@@ -834,35 +840,33 @@ retry:
 	ret = gfs2_glock_nq(gh);
 	if (ret)
 		goto out_uninit;
-retry_under_glock:
 	pagefault_disable();
 	to->nofault = true;
 	ret = iomap_dio_rw(iocb, to, &gfs2_iomap_ops, NULL,
-			   IOMAP_DIO_PARTIAL, written);
+			   IOMAP_DIO_PARTIAL, NULL, read);
 	to->nofault = false;
 	pagefault_enable();
+	if (ret <= 0 && ret != -EFAULT)
+		goto out_unlock;
+	/* No increment (+=) because iomap_dio_rw returns a cumulative value. */
 	if (ret > 0)
-		written = ret;
+		read = ret;
 
-	if (should_fault_in_pages(ret, to, &prev_count, &window_size)) {
-		size_t leftover;
-
-		gfs2_holder_allow_demote(gh);
-		leftover = fault_in_iov_iter_writeable(to, window_size);
-		gfs2_holder_disallow_demote(gh);
-		if (leftover != window_size) {
-			if (!gfs2_holder_queued(gh))
-				goto retry;
-			goto retry_under_glock;
-		}
+	if (should_fault_in_pages(to, iocb, &prev_count, &window_size)) {
+		gfs2_glock_dq(gh);
+		window_size -= fault_in_iov_iter_writeable(to, window_size);
+		if (window_size)
+			goto retry;
 	}
+out_unlock:
 	if (gfs2_holder_queued(gh))
 		gfs2_glock_dq(gh);
 out_uninit:
 	gfs2_holder_uninit(gh);
+	/* User space doesn't expect partial success. */
 	if (ret < 0)
 		return ret;
-	return written;
+	return read;
 }
 
 static ssize_t gfs2_file_direct_write(struct kiocb *iocb, struct iov_iter *from,
@@ -872,7 +876,8 @@ static ssize_t gfs2_file_direct_write(struct kiocb *iocb, struct iov_iter *from,
 	struct inode *inode = file->f_mapping->host;
 	struct gfs2_inode *ip = GFS2_I(inode);
 	size_t prev_count = 0, window_size = 0;
-	size_t read = 0;
+	size_t written = 0;
+	bool enough_retries;
 	ssize_t ret;
 
 	/*
@@ -898,41 +903,45 @@ retry:
 	ret = gfs2_glock_nq(gh);
 	if (ret)
 		goto out_uninit;
-retry_under_glock:
 	/* Silently fall back to buffered I/O when writing beyond EOF */
 	if (iocb->ki_pos + iov_iter_count(from) > i_size_read(&ip->i_inode))
-		goto out;
+		goto out_unlock;
 
 	from->nofault = true;
 	ret = iomap_dio_rw(iocb, from, &gfs2_iomap_ops, NULL,
-			   IOMAP_DIO_PARTIAL, read);
+			   IOMAP_DIO_PARTIAL, NULL, written);
 	from->nofault = false;
-
-	if (ret == -ENOTBLK)
-		ret = 0;
+	if (ret <= 0) {
+		if (ret == -ENOTBLK)
+			ret = 0;
+		if (ret != -EFAULT)
+			goto out_unlock;
+	}
+	/* No increment (+=) because iomap_dio_rw returns a cumulative value. */
 	if (ret > 0)
-		read = ret;
+		written = ret;
 
-	if (should_fault_in_pages(ret, from, &prev_count, &window_size)) {
-		size_t leftover;
-
-		gfs2_holder_allow_demote(gh);
-		leftover = fault_in_iov_iter_readable(from, window_size);
-		gfs2_holder_disallow_demote(gh);
-		if (leftover != window_size) {
-			if (!gfs2_holder_queued(gh))
+	enough_retries = prev_count == iov_iter_count(from) &&
+			 window_size <= PAGE_SIZE;
+	if (should_fault_in_pages(from, iocb, &prev_count, &window_size)) {
+		gfs2_glock_dq(gh);
+		window_size -= fault_in_iov_iter_readable(from, window_size);
+		if (window_size) {
+			if (!enough_retries)
 				goto retry;
-			goto retry_under_glock;
+			/* fall back to buffered I/O */
+			ret = 0;
 		}
 	}
-out:
+out_unlock:
 	if (gfs2_holder_queued(gh))
 		gfs2_glock_dq(gh);
 out_uninit:
 	gfs2_holder_uninit(gh);
+	/* User space doesn't expect partial success. */
 	if (ret < 0)
 		return ret;
-	return read;
+	return written;
 }
 
 static ssize_t gfs2_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
@@ -940,7 +949,7 @@ static ssize_t gfs2_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	struct gfs2_inode *ip;
 	struct gfs2_holder gh;
 	size_t prev_count = 0, window_size = 0;
-	size_t written = 0;
+	size_t read = 0;
 	ssize_t ret;
 
 	/*
@@ -950,20 +959,19 @@ static ssize_t gfs2_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * and retry.
 	 */
 
-	if (iocb->ki_flags & IOCB_DIRECT) {
-		ret = gfs2_file_direct_read(iocb, to, &gh);
-		if (likely(ret != -ENOTBLK))
-			return ret;
-		iocb->ki_flags &= ~IOCB_DIRECT;
-	}
+	if (iocb->ki_flags & IOCB_DIRECT)
+		return gfs2_file_direct_read(iocb, to, &gh);
+
+	pagefault_disable();
 	iocb->ki_flags |= IOCB_NOIO;
 	ret = generic_file_read_iter(iocb, to);
 	iocb->ki_flags &= ~IOCB_NOIO;
+	pagefault_enable();
 	if (ret >= 0) {
 		if (!iov_iter_count(to))
 			return ret;
-		written = ret;
-	} else {
+		read = ret;
+	} else if (ret != -EFAULT) {
 		if (ret != -EAGAIN)
 			return ret;
 		if (iocb->ki_flags & IOCB_NOWAIT)
@@ -975,33 +983,26 @@ retry:
 	ret = gfs2_glock_nq(&gh);
 	if (ret)
 		goto out_uninit;
-retry_under_glock:
 	pagefault_disable();
 	ret = generic_file_read_iter(iocb, to);
 	pagefault_enable();
+	if (ret <= 0 && ret != -EFAULT)
+		goto out_unlock;
 	if (ret > 0)
-		written += ret;
+		read += ret;
 
-	if (should_fault_in_pages(ret, to, &prev_count, &window_size)) {
-		size_t leftover;
-
-		gfs2_holder_allow_demote(&gh);
-		leftover = fault_in_iov_iter_writeable(to, window_size);
-		gfs2_holder_disallow_demote(&gh);
-		if (leftover != window_size) {
-			if (!gfs2_holder_queued(&gh)) {
-				if (written)
-					goto out_uninit;
-				goto retry;
-			}
-			goto retry_under_glock;
-		}
+	if (should_fault_in_pages(to, iocb, &prev_count, &window_size)) {
+		gfs2_glock_dq(&gh);
+		window_size -= fault_in_iov_iter_writeable(to, window_size);
+		if (window_size)
+			goto retry;
 	}
+out_unlock:
 	if (gfs2_holder_queued(&gh))
 		gfs2_glock_dq(&gh);
 out_uninit:
 	gfs2_holder_uninit(&gh);
-	return written ? written : ret;
+	return read ? read : ret;
 }
 
 static ssize_t gfs2_file_buffered_write(struct kiocb *iocb,
@@ -1015,7 +1016,7 @@ static ssize_t gfs2_file_buffered_write(struct kiocb *iocb,
 	struct gfs2_holder *statfs_gh = NULL;
 	size_t prev_count = 0, window_size = 0;
 	size_t orig_count = iov_iter_count(from);
-	size_t read = 0;
+	size_t written = 0;
 	ssize_t ret;
 
 	/*
@@ -1032,11 +1033,19 @@ static ssize_t gfs2_file_buffered_write(struct kiocb *iocb,
 	}
 
 	gfs2_holder_init(ip->i_gl, LM_ST_EXCLUSIVE, 0, gh);
+	if (should_fault_in_pages(from, iocb, &prev_count, &window_size)) {
 retry:
+		window_size -= fault_in_iov_iter_readable(from, window_size);
+		if (!window_size) {
+			ret = -EFAULT;
+			goto out_uninit;
+		}
+		from->count = min(from->count, window_size);
+	}
 	ret = gfs2_glock_nq(gh);
 	if (ret)
 		goto out_uninit;
-retry_under_glock:
+
 	if (inode == sdp->sd_rindex) {
 		struct gfs2_inode *m_ip = GFS2_I(sdp->sd_statfs_inode);
 
@@ -1046,44 +1055,31 @@ retry_under_glock:
 			goto out_unlock;
 	}
 
-	current->backing_dev_info = inode_to_bdi(inode);
 	pagefault_disable();
 	ret = iomap_file_buffered_write(iocb, from, &gfs2_iomap_ops);
 	pagefault_enable();
-	current->backing_dev_info = NULL;
-	if (ret > 0) {
-		iocb->ki_pos += ret;
-		read += ret;
-	}
+	if (ret > 0)
+		written += ret;
 
 	if (inode == sdp->sd_rindex)
 		gfs2_glock_dq_uninit(statfs_gh);
 
-	from->count = orig_count - read;
-	if (should_fault_in_pages(ret, from, &prev_count, &window_size)) {
-		size_t leftover;
+	if (ret <= 0 && ret != -EFAULT)
+		goto out_unlock;
 
-		gfs2_holder_allow_demote(gh);
-		leftover = fault_in_iov_iter_readable(from, window_size);
-		gfs2_holder_disallow_demote(gh);
-		if (leftover != window_size) {
-			from->count = min(from->count, window_size - leftover);
-			if (!gfs2_holder_queued(gh)) {
-				if (read)
-					goto out_uninit;
-				goto retry;
-			}
-			goto retry_under_glock;
-		}
+	from->count = orig_count - written;
+	if (should_fault_in_pages(from, iocb, &prev_count, &window_size)) {
+		gfs2_glock_dq(gh);
+		goto retry;
 	}
 out_unlock:
 	if (gfs2_holder_queued(gh))
 		gfs2_glock_dq(gh);
 out_uninit:
 	gfs2_holder_uninit(gh);
-	if (statfs_gh)
-		kfree(statfs_gh);
-	return read ? read : ret;
+	kfree(statfs_gh);
+	from->count = orig_count - written;
+	return written ? written : ret;
 }
 
 /**
@@ -1440,22 +1436,34 @@ static int gfs2_lock(struct file *file, int cmd, struct file_lock *fl)
 
 	if (!(fl->fl_flags & FL_POSIX))
 		return -ENOLCK;
-	if (cmd == F_CANCELLK) {
-		/* Hack: */
-		cmd = F_SETLK;
-		fl->fl_type = F_UNLCK;
-	}
 	if (unlikely(gfs2_withdrawn(sdp))) {
 		if (fl->fl_type == F_UNLCK)
 			locks_lock_file_wait(file, fl);
 		return -EIO;
 	}
-	if (IS_GETLK(cmd))
+	if (cmd == F_CANCELLK)
+		return dlm_posix_cancel(ls->ls_dlm, ip->i_no_addr, file, fl);
+	else if (IS_GETLK(cmd))
 		return dlm_posix_get(ls->ls_dlm, ip->i_no_addr, file, fl);
 	else if (fl->fl_type == F_UNLCK)
 		return dlm_posix_unlock(ls->ls_dlm, ip->i_no_addr, file, fl);
 	else
 		return dlm_posix_lock(ls->ls_dlm, ip->i_no_addr, file, cmd, fl);
+}
+
+static void __flock_holder_uninit(struct file *file, struct gfs2_holder *fl_gh)
+{
+	struct gfs2_glock *gl = gfs2_glock_hold(fl_gh->gh_gl);
+
+	/*
+	 * Make sure gfs2_glock_put() won't sleep under the file->f_lock
+	 * spinlock.
+	 */
+
+	spin_lock(&file->f_lock);
+	gfs2_holder_uninit(fl_gh);
+	spin_unlock(&file->f_lock);
+	gfs2_glock_put(gl);
 }
 
 static int do_flock(struct file *file, int cmd, struct file_lock *fl)
@@ -1470,7 +1478,9 @@ static int do_flock(struct file *file, int cmd, struct file_lock *fl)
 	int sleeptime;
 
 	state = (fl->fl_type == F_WRLCK) ? LM_ST_EXCLUSIVE : LM_ST_SHARED;
-	flags = (IS_SETLKW(cmd) ? 0 : LM_FLAG_TRY_1CB) | GL_EXACT;
+	flags = GL_EXACT | GL_NOPID;
+	if (!IS_SETLKW(cmd))
+		flags |= LM_FLAG_TRY_1CB;
 
 	mutex_lock(&fp->f_fl_mutex);
 
@@ -1489,19 +1499,21 @@ static int do_flock(struct file *file, int cmd, struct file_lock *fl)
 				       &gfs2_flock_glops, CREATE, &gl);
 		if (error)
 			goto out;
+		spin_lock(&file->f_lock);
 		gfs2_holder_init(gl, state, flags, fl_gh);
+		spin_unlock(&file->f_lock);
 		gfs2_glock_put(gl);
 	}
 	for (sleeptime = 1; sleeptime <= 4; sleeptime <<= 1) {
 		error = gfs2_glock_nq(fl_gh);
 		if (error != GLR_TRYFAILED)
 			break;
-		fl_gh->gh_flags = LM_FLAG_TRY | GL_EXACT;
-		fl_gh->gh_error = 0;
+		fl_gh->gh_flags &= ~LM_FLAG_TRY_1CB;
+		fl_gh->gh_flags |= LM_FLAG_TRY;
 		msleep(sleeptime);
 	}
 	if (error) {
-		gfs2_holder_uninit(fl_gh);
+		__flock_holder_uninit(file, fl_gh);
 		if (error == GLR_TRYFAILED)
 			error = -EAGAIN;
 	} else {
@@ -1523,7 +1535,7 @@ static void do_unflock(struct file *file, struct file_lock *fl)
 	locks_lock_file_wait(file, fl);
 	if (gfs2_holder_initialized(fl_gh)) {
 		gfs2_glock_dq(fl_gh);
-		gfs2_holder_uninit(fl_gh);
+		__flock_holder_uninit(file, fl_gh);
 	}
 	mutex_unlock(&fp->f_fl_mutex);
 }
@@ -1563,7 +1575,7 @@ const struct file_operations gfs2_file_fops = {
 	.fsync		= gfs2_fsync,
 	.lock		= gfs2_lock,
 	.flock		= gfs2_flock,
-	.splice_read	= generic_file_splice_read,
+	.splice_read	= copy_splice_read,
 	.splice_write	= gfs2_file_splice_write,
 	.setlease	= simple_nosetlease,
 	.fallocate	= gfs2_fallocate,
@@ -1594,7 +1606,7 @@ const struct file_operations gfs2_file_fops_nolock = {
 	.open		= gfs2_open,
 	.release	= gfs2_release,
 	.fsync		= gfs2_fsync,
-	.splice_read	= generic_file_splice_read,
+	.splice_read	= copy_splice_read,
 	.splice_write	= gfs2_file_splice_write,
 	.setlease	= generic_setlease,
 	.fallocate	= gfs2_fallocate,

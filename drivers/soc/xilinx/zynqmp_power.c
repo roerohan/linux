@@ -11,6 +11,7 @@
 
 #include <linux/mailbox_client.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/reboot.h>
 #include <linux/suspend.h>
@@ -208,7 +209,7 @@ static int zynqmp_pm_probe(struct platform_device *pdev)
 							   GFP_KERNEL);
 		if (!zynqmp_pm_init_suspend_work) {
 			xlnx_unregister_event(PM_INIT_SUSPEND_CB, 0, 0,
-					      suspend_event_callback);
+					      suspend_event_callback, NULL);
 			return -ENOMEM;
 		}
 		event_registered = true;
@@ -218,7 +219,7 @@ static int zynqmp_pm_probe(struct platform_device *pdev)
 	} else if (ret != -EACCES && ret != -ENODEV) {
 		dev_err(&pdev->dev, "Failed to Register with Xilinx Event manager %d\n", ret);
 		return ret;
-	} else if (of_find_property(pdev->dev.of_node, "mboxes", NULL)) {
+	} else if (of_property_present(pdev->dev.of_node, "mboxes")) {
 		zynqmp_pm_init_suspend_work =
 			devm_kzalloc(&pdev->dev,
 				     sizeof(struct zynqmp_pm_work_struct),
@@ -240,10 +241,10 @@ static int zynqmp_pm_probe(struct platform_device *pdev)
 			dev_err(&pdev->dev, "Failed to request rx channel\n");
 			return PTR_ERR(rx_chan);
 		}
-	} else if (of_find_property(pdev->dev.of_node, "interrupts", NULL)) {
+	} else if (of_property_present(pdev->dev.of_node, "interrupts")) {
 		irq = platform_get_irq(pdev, 0);
-		if (irq <= 0)
-			return -ENXIO;
+		if (irq < 0)
+			return irq;
 
 		ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
 						zynqmp_pm_isr,
@@ -263,7 +264,8 @@ static int zynqmp_pm_probe(struct platform_device *pdev)
 	ret = sysfs_create_file(&pdev->dev.kobj, &dev_attr_suspend_mode.attr);
 	if (ret) {
 		if (event_registered) {
-			xlnx_unregister_event(PM_INIT_SUSPEND_CB, 0, 0, suspend_event_callback);
+			xlnx_unregister_event(PM_INIT_SUSPEND_CB, 0, 0, suspend_event_callback,
+					      NULL);
 			event_registered = false;
 		}
 		dev_err(&pdev->dev, "unable to create sysfs interface\n");
@@ -277,7 +279,7 @@ static int zynqmp_pm_remove(struct platform_device *pdev)
 {
 	sysfs_remove_file(&pdev->dev.kobj, &dev_attr_suspend_mode.attr);
 	if (event_registered)
-		xlnx_unregister_event(PM_INIT_SUSPEND_CB, 0, 0, suspend_event_callback);
+		xlnx_unregister_event(PM_INIT_SUSPEND_CB, 0, 0, suspend_event_callback, NULL);
 
 	if (!rx_chan)
 		mbox_free_channel(rx_chan);

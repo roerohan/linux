@@ -47,6 +47,20 @@ static const struct config_entry config_table[] = {
 			{}
 		},
 	},
+	{
+		.flags = FLAG_AMD_SOF,
+		.device = ACP_PCI_DEV_ID,
+		.dmi_table = (const struct dmi_system_id []) {
+			{
+				.matches = {
+					DMI_MATCH(DMI_SYS_VENDOR, "Valve"),
+					DMI_MATCH(DMI_PRODUCT_NAME, "Galileo"),
+					DMI_MATCH(DMI_PRODUCT_FAMILY, "Sephiroth"),
+				},
+			},
+			{}
+		},
+	},
 };
 
 int snd_amd_acp_find_config(struct pci_dev *pci)
@@ -82,6 +96,11 @@ static struct snd_soc_acpi_codecs amp_max = {
 	.codecs = {"MX98360A"}
 };
 
+static struct snd_soc_acpi_codecs amp_max98388 = {
+	.num_codecs = 1,
+	.codecs = {"ADS8388"}
+};
+
 struct snd_soc_acpi_mach snd_soc_acpi_amd_sof_machines[] = {
 	{
 		.id = "10EC5682",
@@ -111,6 +130,15 @@ struct snd_soc_acpi_mach snd_soc_acpi_amd_sof_machines[] = {
 		.sof_tplg_filename = "sof-rn-rt5682-max98360.tplg",
 	},
 	{
+		.id = "RTL5682",
+		.drv_name = "rt5682s-rt1019",
+		.pdata = (void *)&acp_quirk_data,
+		.machine_quirk = snd_soc_acpi_codec_list,
+		.quirk_data = &amp_rt1019,
+		.fw_filename = "sof-rn.ri",
+		.sof_tplg_filename = "sof-rn-rt5682-rt1019.tplg",
+	},
+	{
 		.id = "AMDI1019",
 		.drv_name = "renoir-dsp",
 		.pdata = (void *)&acp_quirk_data,
@@ -120,5 +148,49 @@ struct snd_soc_acpi_mach snd_soc_acpi_amd_sof_machines[] = {
 	{},
 };
 EXPORT_SYMBOL(snd_soc_acpi_amd_sof_machines);
+
+struct snd_soc_acpi_mach snd_soc_acpi_amd_vangogh_sof_machines[] = {
+	{
+		.id = "NVTN2020",
+		.drv_name = "nau8821-max",
+		.pdata = &acp_quirk_data,
+		.machine_quirk = snd_soc_acpi_codec_list,
+		.quirk_data = &amp_max98388,
+		.fw_filename = "sof-vangogh.ri",
+		.sof_tplg_filename = "sof-vangogh-nau8821-max.tplg",
+	},
+	{},
+};
+EXPORT_SYMBOL(snd_soc_acpi_amd_vangogh_sof_machines);
+
+struct snd_soc_acpi_mach snd_soc_acpi_amd_rmb_sof_machines[] = {
+	{
+		.id = "AMDI1019",
+		.drv_name = "rmb-dsp",
+		.pdata = &acp_quirk_data,
+		.fw_filename = "sof-rmb.ri",
+		.sof_tplg_filename = "sof-acp-rmb.tplg",
+	},
+	{
+		.id = "10508825",
+		.drv_name = "nau8825-max",
+		.pdata = &acp_quirk_data,
+		.machine_quirk = snd_soc_acpi_codec_list,
+		.quirk_data = &amp_max,
+		.fw_filename = "sof-rmb.ri",
+		.sof_tplg_filename = "sof-rmb-nau8825-max98360.tplg",
+	},
+	{
+		.id = "RTL5682",
+		.drv_name = "rt5682s-hs-rt1019",
+		.pdata = &acp_quirk_data,
+		.machine_quirk = snd_soc_acpi_codec_list,
+		.quirk_data = &amp_rt1019,
+		.fw_filename = "sof-rmb.ri",
+		.sof_tplg_filename = "sof-rmb-rt5682s-rt1019.tplg",
+	},
+	{},
+};
+EXPORT_SYMBOL(snd_soc_acpi_amd_rmb_sof_machines);
 
 MODULE_LICENSE("Dual BSD/GPL");

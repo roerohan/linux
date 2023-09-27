@@ -764,7 +764,7 @@ static int bq25980_get_charger_property(struct power_supply *psy,
 		if (!state.ce)
 			val->intval = POWER_SUPPLY_CHARGE_TYPE_NONE;
 		else if (state.bypass)
-			val->intval = POWER_SUPPLY_CHARGE_TYPE_FAST;
+			val->intval = POWER_SUPPLY_CHARGE_TYPE_BYPASS;
 		else if (!state.bypass)
 			val->intval = POWER_SUPPLY_CHARGE_TYPE_STANDARD;
 		break;
@@ -1207,9 +1207,9 @@ static int bq25980_parse_dt(struct bq25980_device *bq)
 	return 0;
 }
 
-static int bq25980_probe(struct i2c_client *client,
-			 const struct i2c_device_id *id)
+static int bq25980_probe(struct i2c_client *client)
 {
+	const struct i2c_device_id *id = i2c_client_get_device_id(client);
 	struct device *dev = &client->dev;
 	struct bq25980_device *bq;
 	int ret;

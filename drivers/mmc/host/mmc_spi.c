@@ -1437,7 +1437,7 @@ static int mmc_spi_probe(struct spi_device *spi)
 
 	status = mmc_add_host(mmc);
 	if (status != 0)
-		goto fail_add_host;
+		goto fail_glue_init;
 
 	/*
 	 * Index 0 is card detect
@@ -1445,7 +1445,7 @@ static int mmc_spi_probe(struct spi_device *spi)
 	 */
 	status = mmc_gpiod_request_cd(mmc, NULL, 0, false, 1000);
 	if (status == -EPROBE_DEFER)
-		goto fail_add_host;
+		goto fail_gpiod_request;
 	if (!status) {
 		/*
 		 * The platform has a CD GPIO signal that may support
@@ -1460,7 +1460,7 @@ static int mmc_spi_probe(struct spi_device *spi)
 	/* Index 1 is write protect/read only */
 	status = mmc_gpiod_request_ro(mmc, NULL, 1, 0);
 	if (status == -EPROBE_DEFER)
-		goto fail_add_host;
+		goto fail_gpiod_request;
 	if (!status)
 		has_ro = true;
 
@@ -1474,7 +1474,7 @@ static int mmc_spi_probe(struct spi_device *spi)
 				? ", cd polling" : "");
 	return 0;
 
-fail_add_host:
+fail_gpiod_request:
 	mmc_remove_host(mmc);
 fail_glue_init:
 	mmc_spi_dma_free(host);
@@ -1489,7 +1489,7 @@ nomem:
 }
 
 
-static int mmc_spi_remove(struct spi_device *spi)
+static void mmc_spi_remove(struct spi_device *spi)
 {
 	struct mmc_host		*mmc = dev_get_drvdata(&spi->dev);
 	struct mmc_spi_host	*host = mmc_priv(mmc);
@@ -1507,7 +1507,6 @@ static int mmc_spi_remove(struct spi_device *spi)
 	spi->max_speed_hz = mmc->f_max;
 	mmc_spi_put_pdata(spi);
 	mmc_free_host(mmc);
-	return 0;
 }
 
 static const struct spi_device_id mmc_spi_dev_ids[] = {

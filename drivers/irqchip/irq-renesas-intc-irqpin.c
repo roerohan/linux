@@ -17,7 +17,6 @@
 #include <linux/err.h>
 #include <linux/slab.h>
 #include <linux/module.h>
-#include <linux/of_device.h>
 #include <linux/pm_runtime.h>
 
 #define INTC_IRQPIN_MAX 8 /* maximum 8 interrupts per driver instance */
@@ -508,7 +507,6 @@ static int intc_irqpin_probe(struct platform_device *pdev)
 
 	irq_chip = &p->irq_chip;
 	irq_chip->name = "intc-irqpin";
-	irq_chip->parent_device = dev;
 	irq_chip->irq_mask = disable_fn;
 	irq_chip->irq_unmask = enable_fn;
 	irq_chip->irq_set_type = intc_irqpin_irq_set_type;
@@ -522,6 +520,8 @@ static int intc_irqpin_probe(struct platform_device *pdev)
 		dev_err(dev, "cannot initialize irq domain\n");
 		goto err0;
 	}
+
+	irq_domain_set_pm_device(p->irq_domain, dev);
 
 	if (p->shared_irqs) {
 		/* request one shared interrupt */
@@ -607,4 +607,3 @@ module_exit(intc_irqpin_exit);
 
 MODULE_AUTHOR("Magnus Damm");
 MODULE_DESCRIPTION("Renesas INTC External IRQ Pin Driver");
-MODULE_LICENSE("GPL v2");

@@ -716,7 +716,6 @@ struct qeth_card_info {
 	u16 chid;
 	u8 ids_valid:1; /* cssid,iid,chid */
 	u8 dev_addr_is_registered:1;
-	u8 open_when_online:1;
 	u8 promisc_mode:1;
 	u8 use_v1_blkt:1;
 	u8 is_vm_nic:1;
@@ -800,8 +799,6 @@ struct qeth_priv {
 	u32 brport_hw_features;
 	u32 brport_features;
 };
-
-#define QETH_NAPI_WEIGHT NAPI_POLL_WEIGHT
 
 struct qeth_card {
 	enum qeth_card_states state;

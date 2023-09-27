@@ -21,7 +21,6 @@
  * Callbacks for platform drivers to implement.
  */
 extern void (*pm_power_off)(void);
-extern void (*pm_power_off_prepare)(void);
 
 struct device; /* we have a circular dep with device.h */
 #ifdef CONFIG_VT_CONSOLE_SLEEP
@@ -35,6 +34,15 @@ static inline void pm_vt_switch_unregister(struct device *dev)
 {
 }
 #endif /* CONFIG_VT_CONSOLE_SLEEP */
+
+#ifdef CONFIG_CXL_SUSPEND
+bool cxl_mem_active(void);
+#else
+static inline bool cxl_mem_active(void)
+{
+	return false;
+}
+#endif
 
 /*
  * Device power management
@@ -367,18 +375,23 @@ const struct dev_pm_ops name = { \
 }
 
 #ifdef CONFIG_PM
-#define _EXPORT_DEV_PM_OPS(name, suspend_fn, resume_fn, runtime_suspend_fn, \
-			   runtime_resume_fn, idle_fn, sec) \
-	_DEFINE_DEV_PM_OPS(name, suspend_fn, resume_fn, runtime_suspend_fn, \
-			   runtime_resume_fn, idle_fn); \
-	_EXPORT_SYMBOL(name, sec)
+#define _EXPORT_DEV_PM_OPS(name, license, ns)				\
+	const struct dev_pm_ops name;					\
+	__EXPORT_SYMBOL(name, license, ns);				\
+	const struct dev_pm_ops name
+#define EXPORT_PM_FN_GPL(name)		EXPORT_SYMBOL_GPL(name)
+#define EXPORT_PM_FN_NS_GPL(name, ns)	EXPORT_SYMBOL_NS_GPL(name, ns)
 #else
-#define _EXPORT_DEV_PM_OPS(name, suspend_fn, resume_fn, runtime_suspend_fn, \
-			   runtime_resume_fn, idle_fn, sec) \
-static __maybe_unused _DEFINE_DEV_PM_OPS(__static_##name, suspend_fn, \
-					 resume_fn, runtime_suspend_fn, \
-					 runtime_resume_fn, idle_fn)
+#define _EXPORT_DEV_PM_OPS(name, license, ns)				\
+	static __maybe_unused const struct dev_pm_ops __static_##name
+#define EXPORT_PM_FN_GPL(name)
+#define EXPORT_PM_FN_NS_GPL(name, ns)
 #endif
+
+#define EXPORT_DEV_PM_OPS(name) _EXPORT_DEV_PM_OPS(name, "", "")
+#define EXPORT_GPL_DEV_PM_OPS(name) _EXPORT_DEV_PM_OPS(name, "GPL", "")
+#define EXPORT_NS_DEV_PM_OPS(name, ns) _EXPORT_DEV_PM_OPS(name, "", #ns)
+#define EXPORT_NS_GPL_DEV_PM_OPS(name, ns) _EXPORT_DEV_PM_OPS(name, "GPL", #ns)
 
 /*
  * Use this if you want to use the same suspend and resume callbacks for suspend
@@ -391,9 +404,21 @@ static __maybe_unused _DEFINE_DEV_PM_OPS(__static_##name, suspend_fn, \
 	_DEFINE_DEV_PM_OPS(name, suspend_fn, resume_fn, NULL, NULL, NULL)
 
 #define EXPORT_SIMPLE_DEV_PM_OPS(name, suspend_fn, resume_fn) \
-	_EXPORT_DEV_PM_OPS(name, suspend_fn, resume_fn, NULL, NULL, NULL, "")
+	EXPORT_DEV_PM_OPS(name) = { \
+		SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn) \
+	}
 #define EXPORT_GPL_SIMPLE_DEV_PM_OPS(name, suspend_fn, resume_fn) \
-	_EXPORT_DEV_PM_OPS(name, suspend_fn, resume_fn, NULL, NULL, NULL, "_gpl")
+	EXPORT_GPL_DEV_PM_OPS(name) = { \
+		SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn) \
+	}
+#define EXPORT_NS_SIMPLE_DEV_PM_OPS(name, suspend_fn, resume_fn, ns)	\
+	EXPORT_NS_DEV_PM_OPS(name, ns) = { \
+		SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn) \
+	}
+#define EXPORT_NS_GPL_SIMPLE_DEV_PM_OPS(name, suspend_fn, resume_fn, ns)	\
+	EXPORT_NS_GPL_DEV_PM_OPS(name, ns) = { \
+		SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn) \
+	}
 
 /* Deprecated. Use DEFINE_SIMPLE_DEV_PM_OPS() instead. */
 #define SIMPLE_DEV_PM_OPS(name, suspend_fn, resume_fn) \
@@ -421,6 +446,15 @@ const struct dev_pm_ops __maybe_unused name = { \
 const struct dev_pm_ops __maybe_unused name = { \
 	SET_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn) \
 	SET_RUNTIME_PM_OPS(suspend_fn, resume_fn, idle_fn) \
+}
+
+/*
+ * Use this if you want to have the suspend and resume callbacks be called
+ * with IRQs disabled.
+ */
+#define DEFINE_NOIRQ_DEV_PM_OPS(name, suspend_fn, resume_fn) \
+const struct dev_pm_ops name = { \
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn) \
 }
 
 #define pm_ptr(_ptr) PTR_IF(IS_ENABLED(CONFIG_PM), (_ptr))
@@ -770,11 +804,11 @@ extern int dpm_suspend_late(pm_message_t state);
 extern int dpm_suspend(pm_message_t state);
 extern int dpm_prepare(pm_message_t state);
 
-extern void __suspend_report_result(const char *function, void *fn, int ret);
+extern void __suspend_report_result(const char *function, struct device *dev, void *fn, int ret);
 
-#define suspend_report_result(fn, ret)					\
+#define suspend_report_result(dev, fn, ret)				\
 	do {								\
-		__suspend_report_result(__func__, fn, ret);		\
+		__suspend_report_result(__func__, dev, fn, ret);	\
 	} while (0)
 
 extern int device_pm_wait_for_dev(struct device *sub, struct device *dev);
@@ -814,7 +848,7 @@ static inline int dpm_suspend_start(pm_message_t state)
 	return 0;
 }
 
-#define suspend_report_result(fn, ret)		do {} while (0)
+#define suspend_report_result(dev, fn, ret)	do {} while (0)
 
 static inline int device_pm_wait_for_dev(struct device *a, struct device *b)
 {

@@ -180,7 +180,7 @@ static void wake_hw_thread(void *info)
 	unsigned long inia;
 	int cpu = *(const int *)info;
 
-	inia = *(unsigned long *)fsl_secondary_thread_init;
+	inia = ppc_function_entry(fsl_secondary_thread_init);
 	book3e_start_thread(cpu_thread_in_core(cpu), inia);
 }
 #endif
@@ -208,7 +208,7 @@ static int smp_85xx_start_cpu(int cpu)
 	 * The bootpage and highmem can be accessed via ioremap(), but
 	 * we need to directly access the spinloop if its in lowmem.
 	 */
-	ioremappable = *cpu_rel_addr > virt_to_phys(high_memory);
+	ioremappable = *cpu_rel_addr > virt_to_phys(high_memory - 1);
 
 	/* Map the spin table */
 	if (ioremappable)

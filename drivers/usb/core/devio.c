@@ -139,30 +139,42 @@ MODULE_PARM_DESC(usbfs_memory_mb,
 /* Hard limit, necessary to avoid arithmetic overflow */
 #define USBFS_XFER_MAX         (UINT_MAX / 2 - 1000000)
 
-static atomic64_t usbfs_memory_usage;	/* Total memory currently allocated */
+static DEFINE_SPINLOCK(usbfs_memory_usage_lock);
+static u64 usbfs_memory_usage;	/* Total memory currently allocated */
 
 /* Check whether it's okay to allocate more memory for a transfer */
 static int usbfs_increase_memory_usage(u64 amount)
 {
-	u64 lim;
+	u64 lim, total_mem;
+	unsigned long flags;
+	int ret;
 
 	lim = READ_ONCE(usbfs_memory_mb);
 	lim <<= 20;
 
-	atomic64_add(amount, &usbfs_memory_usage);
+	ret = 0;
+	spin_lock_irqsave(&usbfs_memory_usage_lock, flags);
+	total_mem = usbfs_memory_usage + amount;
+	if (lim > 0 && total_mem > lim)
+		ret = -ENOMEM;
+	else
+		usbfs_memory_usage = total_mem;
+	spin_unlock_irqrestore(&usbfs_memory_usage_lock, flags);
 
-	if (lim > 0 && atomic64_read(&usbfs_memory_usage) > lim) {
-		atomic64_sub(amount, &usbfs_memory_usage);
-		return -ENOMEM;
-	}
-
-	return 0;
+	return ret;
 }
 
 /* Memory for a transfer is being deallocated */
 static void usbfs_decrease_memory_usage(u64 amount)
 {
-	atomic64_sub(amount, &usbfs_memory_usage);
+	unsigned long flags;
+
+	spin_lock_irqsave(&usbfs_memory_usage_lock, flags);
+	if (amount > usbfs_memory_usage)
+		usbfs_memory_usage = 0;
+	else
+		usbfs_memory_usage -= amount;
+	spin_unlock_irqrestore(&usbfs_memory_usage_lock, flags);
 }
 
 static int connected(struct usb_dev_state *ps)
@@ -174,6 +186,7 @@ static int connected(struct usb_dev_state *ps)
 static void dec_usb_memory_use_count(struct usb_memory *usbm, int *count)
 {
 	struct usb_dev_state *ps = usbm->ps;
+	struct usb_hcd *hcd = bus_to_hcd(ps->dev->bus);
 	unsigned long flags;
 
 	spin_lock_irqsave(&ps->lock, flags);
@@ -182,8 +195,8 @@ static void dec_usb_memory_use_count(struct usb_memory *usbm, int *count)
 		list_del(&usbm->memlist);
 		spin_unlock_irqrestore(&ps->lock, flags);
 
-		usb_free_coherent(ps->dev, usbm->size, usbm->mem,
-				usbm->dma_handle);
+		hcd_buffer_free_pages(hcd, usbm->size,
+				usbm->mem, usbm->dma_handle);
 		usbfs_decrease_memory_usage(
 			usbm->size + sizeof(struct usb_memory));
 		kfree(usbm);
@@ -222,7 +235,7 @@ static int usbdev_mmap(struct file *file, struct vm_area_struct *vma)
 	size_t size = vma->vm_end - vma->vm_start;
 	void *mem;
 	unsigned long flags;
-	dma_addr_t dma_handle;
+	dma_addr_t dma_handle = DMA_MAPPING_ERROR;
 	int ret;
 
 	ret = usbfs_increase_memory_usage(size + sizeof(struct usb_memory));
@@ -235,8 +248,8 @@ static int usbdev_mmap(struct file *file, struct vm_area_struct *vma)
 		goto error_decrease_mem;
 	}
 
-	mem = usb_alloc_coherent(ps->dev, size, GFP_USER | __GFP_NOWARN,
-			&dma_handle);
+	mem = hcd_buffer_alloc_pages(hcd,
+			size, GFP_USER | __GFP_NOWARN, &dma_handle);
 	if (!mem) {
 		ret = -ENOMEM;
 		goto error_free_usbm;
@@ -252,7 +265,14 @@ static int usbdev_mmap(struct file *file, struct vm_area_struct *vma)
 	usbm->vma_use_count = 1;
 	INIT_LIST_HEAD(&usbm->memlist);
 
-	if (hcd->localmem_pool || !hcd_uses_dma(hcd)) {
+	/*
+	 * In DMA-unavailable cases, hcd_buffer_alloc_pages allocates
+	 * normal pages and assigns DMA_MAPPING_ERROR to dma_handle. Check
+	 * whether we are in such cases, and then use remap_pfn_range (or
+	 * dma_mmap_coherent) to map normal (or DMA) pages into the user
+	 * space, respectively.
+	 */
+	if (dma_handle == DMA_MAPPING_ERROR) {
 		if (remap_pfn_range(vma, vma->vm_start,
 				    virt_to_phys(usbm->mem) >> PAGE_SHIFT,
 				    size, vma->vm_page_prot) < 0) {
@@ -267,8 +287,7 @@ static int usbdev_mmap(struct file *file, struct vm_area_struct *vma)
 		}
 	}
 
-	vma->vm_flags |= VM_IO;
-	vma->vm_flags |= (VM_DONTEXPAND | VM_DONTDUMP);
+	vm_flags_set(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
 	vma->vm_ops = &usbdev_vm_ops;
 	vma->vm_private_data = usbm;
 
@@ -727,6 +746,7 @@ static int driver_resume(struct usb_interface *intf)
 	return 0;
 }
 
+#ifdef CONFIG_PM
 /* The following routines apply to the entire device, not interfaces */
 void usbfs_notify_suspend(struct usb_device *udev)
 {
@@ -745,6 +765,7 @@ void usbfs_notify_resume(struct usb_device *udev)
 	}
 	mutex_unlock(&usbfs_mutex);
 }
+#endif
 
 struct usb_driver usbfs_driver = {
 	.name =		"usbfs",
@@ -1197,12 +1218,16 @@ static int do_proc_control(struct usb_dev_state *ps,
 
 		usb_unlock_device(dev);
 		i = usbfs_start_wait_urb(urb, tmo, &actlen);
+
+		/* Linger a bit, prior to the next control message. */
+		if (dev->quirks & USB_QUIRK_DELAY_CTRL_MSG)
+			msleep(200);
 		usb_lock_device(dev);
 		snoop_urb(dev, NULL, pipe, actlen, i, COMPLETE, tbuf, actlen);
 		if (!i && actlen) {
 			if (copy_to_user(ctrl->data, tbuf, actlen)) {
 				ret = -EFAULT;
-				goto recv_fault;
+				goto done;
 			}
 		}
 	} else {
@@ -1219,6 +1244,10 @@ static int do_proc_control(struct usb_dev_state *ps,
 
 		usb_unlock_device(dev);
 		i = usbfs_start_wait_urb(urb, tmo, &actlen);
+
+		/* Linger a bit, prior to the next control message. */
+		if (dev->quirks & USB_QUIRK_DELAY_CTRL_MSG)
+			msleep(200);
 		usb_lock_device(dev);
 		snoop_urb(dev, NULL, pipe, actlen, i, COMPLETE, NULL, 0);
 	}
@@ -1230,10 +1259,6 @@ static int do_proc_control(struct usb_dev_state *ps,
 	}
 	ret = (i < 0 ? i : actlen);
 
- recv_fault:
-	/* Linger a bit, prior to the next control message. */
-	if (dev->quirks & USB_QUIRK_DELAY_CTRL_MSG)
-		msleep(200);
  done:
 	kfree(dr);
 	usb_free_urb(urb);
@@ -1418,7 +1443,7 @@ static int proc_getdriver(struct usb_dev_state *ps, void __user *arg)
 	if (!intf || !intf->dev.driver)
 		ret = -ENODATA;
 	else {
-		strlcpy(gd.driver, intf->dev.driver->name,
+		strscpy(gd.driver, intf->dev.driver->name,
 				sizeof(gd.driver));
 		ret = (copy_to_user(arg, &gd, sizeof(gd)) ? -EFAULT : 0);
 	}
@@ -2617,21 +2642,21 @@ static long usbdev_do_ioctl(struct file *file, unsigned int cmd,
 		snoop(&dev->dev, "%s: CONTROL\n", __func__);
 		ret = proc_control(ps, p);
 		if (ret >= 0)
-			inode->i_mtime = current_time(inode);
+			inode->i_mtime = inode_set_ctime_current(inode);
 		break;
 
 	case USBDEVFS_BULK:
 		snoop(&dev->dev, "%s: BULK\n", __func__);
 		ret = proc_bulk(ps, p);
 		if (ret >= 0)
-			inode->i_mtime = current_time(inode);
+			inode->i_mtime = inode_set_ctime_current(inode);
 		break;
 
 	case USBDEVFS_RESETEP:
 		snoop(&dev->dev, "%s: RESETEP\n", __func__);
 		ret = proc_resetep(ps, p);
 		if (ret >= 0)
-			inode->i_mtime = current_time(inode);
+			inode->i_mtime = inode_set_ctime_current(inode);
 		break;
 
 	case USBDEVFS_RESET:
@@ -2643,7 +2668,7 @@ static long usbdev_do_ioctl(struct file *file, unsigned int cmd,
 		snoop(&dev->dev, "%s: CLEAR_HALT\n", __func__);
 		ret = proc_clearhalt(ps, p);
 		if (ret >= 0)
-			inode->i_mtime = current_time(inode);
+			inode->i_mtime = inode_set_ctime_current(inode);
 		break;
 
 	case USBDEVFS_GETDRIVER:
@@ -2670,7 +2695,7 @@ static long usbdev_do_ioctl(struct file *file, unsigned int cmd,
 		snoop(&dev->dev, "%s: SUBMITURB\n", __func__);
 		ret = proc_submiturb(ps, p);
 		if (ret >= 0)
-			inode->i_mtime = current_time(inode);
+			inode->i_mtime = inode_set_ctime_current(inode);
 		break;
 
 #ifdef CONFIG_COMPAT
@@ -2678,14 +2703,14 @@ static long usbdev_do_ioctl(struct file *file, unsigned int cmd,
 		snoop(&dev->dev, "%s: CONTROL32\n", __func__);
 		ret = proc_control_compat(ps, p);
 		if (ret >= 0)
-			inode->i_mtime = current_time(inode);
+			inode->i_mtime = inode_set_ctime_current(inode);
 		break;
 
 	case USBDEVFS_BULK32:
 		snoop(&dev->dev, "%s: BULK32\n", __func__);
 		ret = proc_bulk_compat(ps, p);
 		if (ret >= 0)
-			inode->i_mtime = current_time(inode);
+			inode->i_mtime = inode_set_ctime_current(inode);
 		break;
 
 	case USBDEVFS_DISCSIGNAL32:
@@ -2697,7 +2722,7 @@ static long usbdev_do_ioctl(struct file *file, unsigned int cmd,
 		snoop(&dev->dev, "%s: SUBMITURB32\n", __func__);
 		ret = proc_submiturb_compat(ps, p);
 		if (ret >= 0)
-			inode->i_mtime = current_time(inode);
+			inode->i_mtime = inode_set_ctime_current(inode);
 		break;
 
 	case USBDEVFS_IOCTL32:

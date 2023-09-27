@@ -6,6 +6,7 @@
 
 / {
 	model = "eASIC N5X SoCDK";
+	compatible = "intel,n5x-socdk", "intel,socfpga-agilex";
 
 	aliases {
 		serial0 = &uart0;
@@ -18,10 +19,19 @@
 		stdout-path = "serial0:115200n8";
 	};
 
-	memory {
+	memory@80000000 {
 		device_type = "memory";
 		/* We expect the bootloader to fill in the reg */
-		reg = <0 0 0 0>;
+		reg = <0 0x80000000 0 0>;
+	};
+
+	soc {
+		sdram_edac: memory-controller@f87f8000 {
+			compatible = "snps,ddrc-3.80a";
+			reg = <0xf87f8000 0x400>;
+			interrupts = <0 175 4>;
+			status = "okay";
+		};
 	};
 };
 
@@ -64,6 +74,7 @@
 	cap-sd-highspeed;
 	broken-cd;
 	bus-width = <4>;
+	clk-phase-sd-hs = <0>, <135>;
 };
 
 &osc1 {
@@ -98,7 +109,7 @@
 				reg = <0x0 0x03FE0000>;
 			};
 
-			qspi_rootfs: partition@3FE0000 {
+			qspi_rootfs: partition@3fe0000 {
 				label = "Root Filesystem - JFFS2";
 				reg = <0x03FE0000 0x0C020000>;
 			};

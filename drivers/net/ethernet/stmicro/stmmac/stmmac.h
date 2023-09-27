@@ -21,7 +21,8 @@
 #include <linux/ptp_clock_kernel.h>
 #include <linux/net_tstamp.h>
 #include <linux/reset.h>
-#include <net/page_pool.h>
+#include <net/page_pool/types.h>
+#include <net/xdp.h>
 #include <uapi/linux/bpf.h>
 
 struct stmmac_resources {
@@ -90,6 +91,13 @@ struct stmmac_rx_buffer {
 	};
 	struct page *sec_page;
 	dma_addr_t sec_addr;
+};
+
+struct stmmac_xdp_buff {
+	struct xdp_buff xdp;
+	struct stmmac_priv *priv;
+	struct dma_desc *desc;
+	struct dma_desc *ndesc;
 };
 
 struct stmmac_rx_queue {
@@ -188,6 +196,18 @@ struct stmmac_rfs_entry {
 	int tc;
 };
 
+struct stmmac_dma_conf {
+	unsigned int dma_buf_sz;
+
+	/* RX Queue */
+	struct stmmac_rx_queue rx_queue[MTL_MAX_RX_QUEUES];
+	unsigned int dma_rx_size;
+
+	/* TX Queue */
+	struct stmmac_tx_queue tx_queue[MTL_MAX_TX_QUEUES];
+	unsigned int dma_tx_size;
+};
+
 struct stmmac_priv {
 	/* Frequently used values are kept adjacent for cache effect */
 	u32 tx_coal_frames[MTL_MAX_TX_QUEUES];
@@ -201,7 +221,6 @@ struct stmmac_priv {
 	int sph_cap;
 	u32 sarc_type;
 
-	unsigned int dma_buf_sz;
 	unsigned int rx_copybreak;
 	u32 rx_riwt[MTL_MAX_TX_QUEUES];
 	int hwts_rx_en;
@@ -213,13 +232,7 @@ struct stmmac_priv {
 	int (*hwif_quirks)(struct stmmac_priv *priv);
 	struct mutex lock;
 
-	/* RX Queue */
-	struct stmmac_rx_queue rx_queue[MTL_MAX_RX_QUEUES];
-	unsigned int dma_rx_size;
-
-	/* TX Queue */
-	struct stmmac_tx_queue tx_queue[MTL_MAX_TX_QUEUES];
-	unsigned int dma_tx_size;
+	struct stmmac_dma_conf dma_conf;
 
 	/* Generic channel for NAPI */
 	struct stmmac_channel channel[STMMAC_CH_MAX];
@@ -263,9 +276,10 @@ struct stmmac_priv {
 	u32 adv_ts;
 	int use_riwt;
 	int irq_wake;
-	spinlock_t ptp_lock;
+	rwlock_t ptp_lock;
 	/* Protects auxiliary snapshot registers from concurrent access. */
 	struct mutex aux_ts_lock;
+	wait_queue_head_t tstamp_busy_wait;
 
 	void __iomem *mmcaddr;
 	void __iomem *ptpaddr;
@@ -339,7 +353,7 @@ int stmmac_xdp_open(struct net_device *dev);
 void stmmac_xdp_release(struct net_device *dev);
 int stmmac_resume(struct device *dev);
 int stmmac_suspend(struct device *dev);
-int stmmac_dvr_remove(struct device *dev);
+void stmmac_dvr_remove(struct device *dev);
 int stmmac_dvr_probe(struct device *device,
 		     struct plat_stmmacenet_data *plat_dat,
 		     struct stmmac_resources *res);

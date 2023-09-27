@@ -2,7 +2,7 @@
 /*
  * Implementation of the multi-level security (MLS) policy.
  *
- * Author : Stephen Smalley, <sds@tycho.nsa.gov>
+ * Author : Stephen Smalley, <stephen.smalley.work@gmail.com>
  */
 /*
  * Updated: Trusted Computer Solutions, Inc. <dgoeddel@trustedcs.com>
@@ -45,7 +45,7 @@ int mls_compute_context_len(struct policydb *p, struct context *context)
 
 	len = 1; /* for the beginning ":" */
 	for (l = 0; l < 2; l++) {
-		int index_sens = context->range.level[l].sens;
+		u32 index_sens = context->range.level[l].sens;
 		len += strlen(sym_name(p, SYM_LEVELS, index_sens - 1));
 
 		/* categories */
@@ -156,7 +156,6 @@ void mls_sid_to_context(struct policydb *p,
 	}
 
 	*scontext = scontextp;
-	return;
 }
 
 int mls_level_isvalid(struct policydb *p, struct mls_level *l)
@@ -241,7 +240,8 @@ int mls_context_to_sid(struct policydb *pol,
 	char *sensitivity, *cur_cat, *next_cat, *rngptr;
 	struct level_datum *levdatum;
 	struct cat_datum *catdatum, *rngdatum;
-	int l, rc, i;
+	u32 i;
+	int l, rc;
 	char *rangep[2];
 
 	if (!pol->mls_enabled) {
@@ -452,7 +452,8 @@ int mls_convert_context(struct policydb *oldp,
 	struct level_datum *levdatum;
 	struct cat_datum *catdatum;
 	struct ebitmap_node *node;
-	int l, i;
+	u32 i;
+	int l;
 
 	if (!oldp->mls_enabled || !newp->mls_enabled)
 		return 0;
@@ -496,7 +497,7 @@ int mls_compute_sid(struct policydb *p,
 	struct range_trans rtr;
 	struct mls_range *r;
 	struct class_datum *cladatum;
-	int default_range = 0;
+	char default_range = 0;
 
 	if (!p->mls_enabled)
 		return 0;

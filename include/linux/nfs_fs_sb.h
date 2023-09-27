@@ -48,6 +48,7 @@ struct nfs_client {
 #define NFS_CS_NOPING		6		/* - don't ping on connect */
 #define NFS_CS_DS		7		/* - Server is a DS */
 #define NFS_CS_REUSEPORT	8		/* - reuse src port on reconnect */
+#define NFS_CS_PNFS		9		/* - Server used for pnfs */
 	struct sockaddr_storage	cl_addr;	/* server identifier */
 	size_t			cl_addrlen;
 	char *			cl_hostname;	/* hostname of server */
@@ -63,7 +64,8 @@ struct nfs_client {
 	u32			cl_minorversion;/* NFSv4 minorversion */
 	unsigned int		cl_nconnect;	/* Number of connections */
 	unsigned int		cl_max_connect; /* max number of xprts allowed */
-	const char *		cl_principal;  /* used for machine cred */
+	const char *		cl_principal;	/* used for machine cred */
+	struct xprtsec_parms	cl_xprtsec;	/* xprt security policy */
 
 #if IS_ENABLED(CONFIG_NFS_V4)
 	struct list_head	cl_ds_clients; /* auth flavor data servers */
@@ -138,6 +140,7 @@ struct nfs_server {
 	struct nlm_host		*nlm_host;	/* NLM client handle */
 	struct nfs_iostats __percpu *io_stats;	/* I/O statistics */
 	atomic_long_t		writeback;	/* number of writeback pages */
+	unsigned int		write_congested;/* flag set when writeback gets too high */
 	unsigned int		flags;		/* various flags */
 
 /* The following are for internal use only. Also see uapi/linux/nfs_mount.h */
@@ -151,6 +154,8 @@ struct nfs_server {
 #define NFS_MOUNT_SOFTREVAL		0x800000
 #define NFS_MOUNT_WRITE_EAGER		0x01000000
 #define NFS_MOUNT_WRITE_WAIT		0x02000000
+#define NFS_MOUNT_TRUNK_DISCOVERY	0x04000000
+#define NFS_MOUNT_SHUTDOWN			0x08000000
 
 	unsigned int		fattr_valid;	/* Valid attributes */
 	unsigned int		caps;		/* server capabilities */
@@ -181,6 +186,7 @@ struct nfs_server {
 				change_attr_type;/* Description of change attribute */
 
 	struct nfs_fsid		fsid;
+	int			s_sysfs_id;	/* sysfs dentry index */
 	__u64			maxfilesize;	/* maximum file size */
 	struct timespec64	time_delta;	/* smallest time granularity */
 	unsigned long		mount_time;	/* when this fs was mounted */
@@ -257,6 +263,7 @@ struct nfs_server {
 	/* User namespace info */
 	const struct cred	*cred;
 	bool			has_sec_mnt_opts;
+	struct kobject		kobj;
 };
 
 /* Server capabilities */
@@ -285,4 +292,5 @@ struct nfs_server {
 #define NFS_CAP_XATTR		(1U << 28)
 #define NFS_CAP_READ_PLUS	(1U << 29)
 #define NFS_CAP_FS_LOCATIONS	(1U << 30)
+#define NFS_CAP_MOVEABLE	(1U << 31)
 #endif

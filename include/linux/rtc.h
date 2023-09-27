@@ -110,8 +110,6 @@ struct rtc_device {
 	struct hrtimer pie_timer; /* sub second exp, so needs hrtimer */
 	int pie_enabled;
 	struct work_struct irqwork;
-	/* Some hardware can't support UIE mode */
-	int uie_unsupported;
 
 	/*
 	 * This offset specifies the update timing of the RTC.
@@ -148,6 +146,7 @@ struct rtc_device {
 
 	time64_t range_min;
 	timeu64_t range_max;
+	timeu64_t alarm_offset_max;
 	time64_t start_secs;
 	time64_t offset_secs;
 	bool set_start_time;

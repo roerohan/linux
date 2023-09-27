@@ -21,7 +21,6 @@
 #include "dpu_hw_lm.h"
 #include "dpu_hw_interrupts.h"
 #include "dpu_hw_top.h"
-#include "dpu_io_util.h"
 #include "dpu_rm.h"
 #include "dpu_core_perf.h"
 
@@ -64,28 +63,14 @@
 #define ktime_compare_safe(A, B) \
 	ktime_compare(ktime_sub((A), (B)), ktime_set(0, 0))
 
-#define DPU_NAME_SIZE  12
-
-/*
- * struct dpu_irq_callback - IRQ callback handlers
- * @list: list to callback
- * @func: intr handler
- * @arg: argument for the handler
- */
-struct dpu_irq_callback {
-	struct list_head list;
-	void (*func)(void *arg, int irq_idx);
-	void *arg;
-};
-
 struct dpu_kms {
 	struct msm_kms base;
 	struct drm_device *dev;
-	int core_rev;
-	struct dpu_mdss_cfg *catalog;
+	const struct dpu_mdss_cfg *catalog;
+	const struct msm_mdss_data *mdss;
 
 	/* io/register spaces: */
-	void __iomem *mmio, *vbif[VBIF_MAX], *reg_dma;
+	void __iomem *mmio, *vbif[VBIF_MAX];
 
 	struct regulator *vdd;
 	struct regulator *mmagic;
@@ -113,7 +98,8 @@ struct dpu_kms {
 	struct platform_device *pdev;
 	bool rpm_enabled;
 
-	struct dss_module_power mp;
+	struct clk_bulk_data *clocks;
+	size_t num_clocks;
 
 	/* reference count bandwidth requests, so we know when we can
 	 * release bandwidth.  Each atomic update increments, and frame-
@@ -131,6 +117,10 @@ struct vsync_info {
 	u32 line_count;
 };
 
+#define DPU_ENC_WR_PTR_START_TIMEOUT_US 20000
+
+#define DPU_ENC_MAX_POLL_TIMEOUT_US	2000
+
 #define to_dpu_kms(x) container_of(x, struct dpu_kms, base)
 
 #define to_dpu_global_state(x) container_of(x, struct dpu_global_state, base)
@@ -144,8 +134,8 @@ struct dpu_global_state {
 	uint32_t pingpong_to_enc_id[PINGPONG_MAX - PINGPONG_0];
 	uint32_t mixer_to_enc_id[LM_MAX - LM_0];
 	uint32_t ctl_to_enc_id[CTL_MAX - CTL_0];
-	uint32_t intf_to_enc_id[INTF_MAX - INTF_0];
 	uint32_t dspp_to_enc_id[DSPP_MAX - DSPP_0];
+	uint32_t dsc_to_enc_id[DSC_MAX - DSC_0];
 };
 
 struct dpu_global_state
@@ -214,6 +204,6 @@ void dpu_disable_vblank(struct msm_kms *kms, struct drm_crtc *crtc);
  *
  * Return: current clock rate
  */
-u64 dpu_kms_get_clk_rate(struct dpu_kms *dpu_kms, char *clock_name);
+unsigned long dpu_kms_get_clk_rate(struct dpu_kms *dpu_kms, char *clock_name);
 
 #endif /* __dpu_kms_H__ */

@@ -15,7 +15,7 @@
 
 #define DRV_NAME "pata_of_platform"
 
-static struct scsi_host_template pata_platform_sht = {
+static const struct scsi_host_template pata_platform_sht = {
 	ATA_PIO_SHT(DRV_NAME),
 };
 
@@ -79,7 +79,7 @@ static int pata_of_platform_probe(struct platform_device *ofdev)
 
 static const struct of_device_id pata_of_platform_match[] = {
 	{ .compatible = "ata-generic", },
-	{ },
+	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, pata_of_platform_match);
 
@@ -89,7 +89,7 @@ static struct platform_driver pata_of_platform_driver = {
 		.of_match_table = pata_of_platform_match,
 	},
 	.probe		= pata_of_platform_probe,
-	.remove		= ata_platform_remove_one,
+	.remove_new	= ata_platform_remove_one,
 };
 
 module_platform_driver(pata_of_platform_driver);

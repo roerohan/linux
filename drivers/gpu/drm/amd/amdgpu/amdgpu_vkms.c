@@ -55,8 +55,9 @@ static enum hrtimer_restart amdgpu_vkms_vblank_simulate(struct hrtimer *timer)
 		DRM_WARN("%s: vblank timer overrun\n", __func__);
 
 	ret = drm_crtc_handle_vblank(crtc);
+	/* Don't queue timer again when vblank is disabled. */
 	if (!ret)
-		DRM_ERROR("amdgpu_vkms failure on handling vblank");
+		return HRTIMER_NORESTART;
 
 	return HRTIMER_RESTART;
 }
@@ -81,7 +82,7 @@ static void amdgpu_vkms_disable_vblank(struct drm_crtc *crtc)
 {
 	struct amdgpu_crtc *amdgpu_crtc = to_amdgpu_crtc(crtc);
 
-	hrtimer_cancel(&amdgpu_crtc->vblank_timer);
+	hrtimer_try_to_cancel(&amdgpu_crtc->vblank_timer);
 }
 
 static bool amdgpu_vkms_get_vblank_timestamp(struct drm_crtc *crtc,
@@ -282,8 +283,8 @@ static int amdgpu_vkms_plane_atomic_check(struct drm_plane *plane,
 		return PTR_ERR(crtc_state);
 
 	ret = drm_atomic_helper_check_plane_state(new_plane_state, crtc_state,
-						  DRM_PLANE_HELPER_NO_SCALING,
-						  DRM_PLANE_HELPER_NO_SCALING,
+						  DRM_PLANE_NO_SCALING,
+						  DRM_PLANE_NO_SCALING,
 						  false, true);
 	if (ret != 0)
 		return ret;
@@ -302,9 +303,6 @@ static int amdgpu_vkms_prepare_fb(struct drm_plane *plane,
 	struct drm_gem_object *obj;
 	struct amdgpu_device *adev;
 	struct amdgpu_bo *rbo;
-	struct list_head list;
-	struct ttm_validate_buffer tv;
-	struct ww_acquire_ctx ticket;
 	uint32_t domain;
 	int r;
 
@@ -316,16 +314,17 @@ static int amdgpu_vkms_prepare_fb(struct drm_plane *plane,
 	obj = new_state->fb->obj[0];
 	rbo = gem_to_amdgpu_bo(obj);
 	adev = amdgpu_ttm_adev(rbo->tbo.bdev);
-	INIT_LIST_HEAD(&list);
 
-	tv.bo = &rbo->tbo;
-	tv.num_shared = 1;
-	list_add(&tv.head, &list);
-
-	r = ttm_eu_reserve_buffers(&ticket, &list, false, NULL);
+	r = amdgpu_bo_reserve(rbo, true);
 	if (r) {
 		dev_err(adev->dev, "fail to reserve bo (%d)\n", r);
 		return r;
+	}
+
+	r = dma_resv_reserve_fences(rbo->tbo.base.resv, 1);
+	if (r) {
+		dev_err(adev->dev, "allocating fence slot failed (%d)\n", r);
+		goto error_unlock;
 	}
 
 	if (plane->type != DRM_PLANE_TYPE_CURSOR)
@@ -337,25 +336,29 @@ static int amdgpu_vkms_prepare_fb(struct drm_plane *plane,
 	if (unlikely(r != 0)) {
 		if (r != -ERESTARTSYS)
 			DRM_ERROR("Failed to pin framebuffer with error %d\n", r);
-		ttm_eu_backoff_reservation(&ticket, &list);
-		return r;
+		goto error_unlock;
 	}
 
 	r = amdgpu_ttm_alloc_gart(&rbo->tbo);
 	if (unlikely(r != 0)) {
-		amdgpu_bo_unpin(rbo);
-		ttm_eu_backoff_reservation(&ticket, &list);
 		DRM_ERROR("%p bind failed\n", rbo);
-		return r;
+		goto error_unpin;
 	}
 
-	ttm_eu_backoff_reservation(&ticket, &list);
+	amdgpu_bo_unreserve(rbo);
 
 	afb->address = amdgpu_bo_gpu_offset(rbo);
 
 	amdgpu_bo_ref(rbo);
 
 	return 0;
+
+error_unpin:
+	amdgpu_bo_unpin(rbo);
+
+error_unlock:
+	amdgpu_bo_unreserve(rbo);
+	return r;
 }
 
 static void amdgpu_vkms_cleanup_fb(struct drm_plane *plane,
@@ -496,7 +499,7 @@ static int amdgpu_vkms_sw_init(void *handle)
 	adev_to_drm(adev)->mode_config.preferred_depth = 24;
 	adev_to_drm(adev)->mode_config.prefer_shadow = 1;
 
-	adev_to_drm(adev)->mode_config.fb_base = adev->gmc.aper_base;
+	adev_to_drm(adev)->mode_config.fb_modifiers_not_supported = true;
 
 	r = amdgpu_display_modeset_create_props(adev);
 	if (r)
@@ -508,6 +511,10 @@ static int amdgpu_vkms_sw_init(void *handle)
 		if (r)
 			return r;
 	}
+
+	r = drm_vblank_init(adev_to_drm(adev), adev->mode_info.num_crtc);
+	if (r)
+		return r;
 
 	drm_kms_helper_poll_init(adev_to_drm(adev));
 

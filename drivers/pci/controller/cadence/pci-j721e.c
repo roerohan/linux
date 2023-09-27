@@ -14,9 +14,8 @@
 #include <linux/irqdomain.h>
 #include <linux/mfd/syscon.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
-#include <linux/of_irq.h>
 #include <linux/pci.h>
+#include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 
@@ -69,6 +68,7 @@ struct j721e_pcie_data {
 	enum j721e_pcie_mode	mode;
 	unsigned int		quirk_retrain_flag:1;
 	unsigned int		quirk_detect_quiet_flag:1;
+	unsigned int		quirk_disable_flr:1;
 	u32			linkdown_irq_regfield;
 	unsigned int		byte_access_allowed:1;
 };
@@ -307,6 +307,7 @@ static const struct j721e_pcie_data j7200_pcie_rc_data = {
 static const struct j721e_pcie_data j7200_pcie_ep_data = {
 	.mode = PCI_MODE_EP,
 	.quirk_detect_quiet_flag = true,
+	.quirk_disable_flr = true,
 };
 
 static const struct j721e_pcie_data am64_pcie_rc_data = {
@@ -405,6 +406,7 @@ static int j721e_pcie_probe(struct platform_device *pdev)
 			return -ENOMEM;
 
 		ep->quirk_detect_quiet_flag = data->quirk_detect_quiet_flag;
+		ep->quirk_disable_flr = data->quirk_disable_flr;
 
 		cdns_pcie = &ep->pcie;
 		cdns_pcie->dev = dev;
@@ -540,7 +542,7 @@ err_get_sync:
 	return ret;
 }
 
-static int j721e_pcie_remove(struct platform_device *pdev)
+static void j721e_pcie_remove(struct platform_device *pdev)
 {
 	struct j721e_pcie *pcie = platform_get_drvdata(pdev);
 	struct cdns_pcie *cdns_pcie = pcie->cdns_pcie;
@@ -550,13 +552,11 @@ static int j721e_pcie_remove(struct platform_device *pdev)
 	cdns_pcie_disable_phy(cdns_pcie);
 	pm_runtime_put(dev);
 	pm_runtime_disable(dev);
-
-	return 0;
 }
 
 static struct platform_driver j721e_pcie_driver = {
 	.probe  = j721e_pcie_probe,
-	.remove = j721e_pcie_remove,
+	.remove_new = j721e_pcie_remove,
 	.driver = {
 		.name	= "j721e-pcie",
 		.of_match_table = of_j721e_pcie_match,

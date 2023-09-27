@@ -224,25 +224,25 @@ static int bpf_program_profiler__disable(struct evsel *evsel)
 
 static int bpf_program_profiler__read(struct evsel *evsel)
 {
-	// perf_cpu_map uses /sys/devices/system/cpu/online
-	int num_cpu = evsel__nr_cpus(evsel);
 	// BPF_MAP_TYPE_PERCPU_ARRAY uses /sys/devices/system/cpu/possible
 	// Sometimes possible > online, like on a Ryzen 3900X that has 24
 	// threads but its possible showed 0-31 -acme
 	int num_cpu_bpf = libbpf_num_possible_cpus();
 	struct bpf_perf_event_value values[num_cpu_bpf];
 	struct bpf_counter *counter;
+	struct perf_counts_values *counts;
 	int reading_map_fd;
 	__u32 key = 0;
-	int err, cpu;
+	int err, idx, bpf_cpu;
 
 	if (list_empty(&evsel->bpf_counter_list))
 		return -EAGAIN;
 
-	for (cpu = 0; cpu < num_cpu; cpu++) {
-		perf_counts(evsel->counts, cpu, 0)->val = 0;
-		perf_counts(evsel->counts, cpu, 0)->ena = 0;
-		perf_counts(evsel->counts, cpu, 0)->run = 0;
+	perf_cpu_map__for_each_idx(idx, evsel__cpus(evsel)) {
+		counts = perf_counts(evsel->counts, idx, 0);
+		counts->val = 0;
+		counts->ena = 0;
+		counts->run = 0;
 	}
 	list_for_each_entry(counter, &evsel->bpf_counter_list, list) {
 		struct bpf_prog_profiler_bpf *skel = counter->skel;
@@ -256,10 +256,15 @@ static int bpf_program_profiler__read(struct evsel *evsel)
 			return err;
 		}
 
-		for (cpu = 0; cpu < num_cpu; cpu++) {
-			perf_counts(evsel->counts, cpu, 0)->val += values[cpu].counter;
-			perf_counts(evsel->counts, cpu, 0)->ena += values[cpu].enabled;
-			perf_counts(evsel->counts, cpu, 0)->run += values[cpu].running;
+		for (bpf_cpu = 0; bpf_cpu < num_cpu_bpf; bpf_cpu++) {
+			idx = perf_cpu_map__idx(evsel__cpus(evsel),
+						(struct perf_cpu){.cpu = bpf_cpu});
+			if (idx == -1)
+				continue;
+			counts = perf_counts(evsel->counts, idx, 0);
+			counts->val += values[bpf_cpu].counter;
+			counts->ena += values[bpf_cpu].enabled;
+			counts->run += values[bpf_cpu].running;
 		}
 	}
 	return 0;
@@ -305,20 +310,6 @@ static bool bperf_attr_map_compatible(int attr_map_fd)
 		return false;
 	return (map_info.key_size == sizeof(struct perf_event_attr)) &&
 		(map_info.value_size == sizeof(struct perf_event_attr_map_entry));
-}
-
-int __weak
-bpf_map_create(enum bpf_map_type map_type,
-	       const char *map_name __maybe_unused,
-	       __u32 key_size,
-	       __u32 value_size,
-	       __u32 max_entries,
-	       const struct bpf_map_create_opts *opts __maybe_unused)
-{
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-	return bpf_create_map(map_type, key_size, value_size, max_entries, 0);
-#pragma GCC diagnostic pop
 }
 
 static int bperf_lock_attr_map(struct target *target)
@@ -552,9 +543,9 @@ static int bperf__load(struct evsel *evsel, struct target *target)
 
 		if (filter_type == BPERF_FILTER_PID ||
 		    filter_type == BPERF_FILTER_TGID)
-			key = evsel->core.threads->map[i].pid;
+			key = perf_thread_map__pid(evsel->core.threads, i);
 		else if (filter_type == BPERF_FILTER_CPU)
-			key = evsel->core.cpus->map[i].cpu;
+			key = perf_cpu_map__cpu(evsel->core.cpus, i).cpu;
 		else
 			break;
 
@@ -596,9 +587,9 @@ static int bperf_sync_counters(struct evsel *evsel)
 {
 	int num_cpu, i, cpu;
 
-	num_cpu = all_cpu_map->nr;
+	num_cpu = perf_cpu_map__nr(all_cpu_map);
 	for (i = 0; i < num_cpu; i++) {
-		cpu = all_cpu_map->map[i].cpu;
+		cpu = perf_cpu_map__cpu(all_cpu_map, i).cpu;
 		bperf_trigger_reading(evsel->bperf_leader_prog_fd, cpu);
 	}
 	return 0;
@@ -621,6 +612,7 @@ static int bperf__read(struct evsel *evsel)
 	struct bperf_follower_bpf *skel = evsel->follower_skel;
 	__u32 num_cpu_bpf = cpu__max_cpu().cpu;
 	struct bpf_perf_event_value values[num_cpu_bpf];
+	struct perf_counts_values *counts;
 	int reading_map_fd, err = 0;
 	__u32 i;
 	int j;
@@ -639,29 +631,32 @@ static int bperf__read(struct evsel *evsel)
 		case BPERF_FILTER_GLOBAL:
 			assert(i == 0);
 
-			perf_cpu_map__for_each_cpu(entry, j, all_cpu_map) {
-				cpu = entry.cpu;
-				perf_counts(evsel->counts, cpu, 0)->val = values[cpu].counter;
-				perf_counts(evsel->counts, cpu, 0)->ena = values[cpu].enabled;
-				perf_counts(evsel->counts, cpu, 0)->run = values[cpu].running;
+			perf_cpu_map__for_each_cpu(entry, j, evsel__cpus(evsel)) {
+				counts = perf_counts(evsel->counts, j, 0);
+				counts->val = values[entry.cpu].counter;
+				counts->ena = values[entry.cpu].enabled;
+				counts->run = values[entry.cpu].running;
 			}
 			break;
 		case BPERF_FILTER_CPU:
-			cpu = evsel->core.cpus->map[i].cpu;
-			perf_counts(evsel->counts, i, 0)->val = values[cpu].counter;
-			perf_counts(evsel->counts, i, 0)->ena = values[cpu].enabled;
-			perf_counts(evsel->counts, i, 0)->run = values[cpu].running;
+			cpu = perf_cpu_map__cpu(evsel__cpus(evsel), i).cpu;
+			assert(cpu >= 0);
+			counts = perf_counts(evsel->counts, i, 0);
+			counts->val = values[cpu].counter;
+			counts->ena = values[cpu].enabled;
+			counts->run = values[cpu].running;
 			break;
 		case BPERF_FILTER_PID:
 		case BPERF_FILTER_TGID:
-			perf_counts(evsel->counts, 0, i)->val = 0;
-			perf_counts(evsel->counts, 0, i)->ena = 0;
-			perf_counts(evsel->counts, 0, i)->run = 0;
+			counts = perf_counts(evsel->counts, 0, i);
+			counts->val = 0;
+			counts->ena = 0;
+			counts->run = 0;
 
 			for (cpu = 0; cpu < num_cpu_bpf; cpu++) {
-				perf_counts(evsel->counts, 0, i)->val += values[cpu].counter;
-				perf_counts(evsel->counts, 0, i)->ena += values[cpu].enabled;
-				perf_counts(evsel->counts, 0, i)->run += values[cpu].running;
+				counts->val += values[cpu].counter;
+				counts->ena += values[cpu].enabled;
+				counts->run += values[cpu].running;
 			}
 			break;
 		default:
@@ -768,8 +763,7 @@ extern struct bpf_counter_ops bperf_cgrp_ops;
 
 static inline bool bpf_counter_skip(struct evsel *evsel)
 {
-	return list_empty(&evsel->bpf_counter_list) &&
-		evsel->follower_skel == NULL;
+	return evsel->bpf_counter_ops == NULL;
 }
 
 int bpf_counter__install_pe(struct evsel *evsel, int cpu_map_idx, int fd)
@@ -821,4 +815,5 @@ void bpf_counter__destroy(struct evsel *evsel)
 		return;
 	evsel->bpf_counter_ops->destroy(evsel);
 	evsel->bpf_counter_ops = NULL;
+	evsel->bpf_skel = NULL;
 }

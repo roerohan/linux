@@ -11,19 +11,19 @@ via sysfs
 product_name
 ------------
 
-.. kernel-doc:: drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+.. kernel-doc:: drivers/gpu/drm/amd/amdgpu/amdgpu_fru_eeprom.c
    :doc: product_name
 
 product_number
 --------------
 
-.. kernel-doc:: drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
-   :doc: product_name
+.. kernel-doc:: drivers/gpu/drm/amd/amdgpu/amdgpu_fru_eeprom.c
+   :doc: product_number
 
 serial_number
 -------------
 
-.. kernel-doc:: drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+.. kernel-doc:: drivers/gpu/drm/amd/amdgpu/amdgpu_fru_eeprom.c
    :doc: serial_number
 
 unique_id
@@ -31,6 +31,23 @@ unique_id
 
 .. kernel-doc:: drivers/gpu/drm/amd/pm/amdgpu_pm.c
    :doc: unique_id
+
+Accelerated Processing Units (APU) Info
+---------------------------------------
+
+.. csv-table::
+   :header-rows: 1
+   :widths: 3, 2, 2, 1, 1, 1, 1
+   :file: ./apu-asic-info-table.csv
+
+Discrete GPU Info
+-----------------
+
+.. csv-table::
+   :header-rows: 1
+   :widths: 3, 2, 2, 1, 1, 1
+   :file: ./dgpu-asic-info-table.csv
+
 
 GPU Memory Usage Information
 ============================

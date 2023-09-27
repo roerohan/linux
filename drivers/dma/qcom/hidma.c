@@ -45,12 +45,12 @@
 #include <linux/dmaengine.h>
 #include <linux/dma-mapping.h>
 #include <linux/list.h>
+#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/of_dma.h>
-#include <linux/of_device.h>
 #include <linux/property.h>
 #include <linux/delay.h>
 #include <linux/acpi.h>
@@ -214,7 +214,6 @@ static int hidma_chan_init(struct hidma_dev *dmadev, u32 dma_sig)
 
 	spin_lock_init(&mchan->lock);
 	list_add_tail(&mchan->chan.device_node, &ddev->channels);
-	dmadev->ddev.chancnt++;
 	return 0;
 }
 
@@ -431,6 +430,7 @@ hidma_prep_dma_memset(struct dma_chan *dmach, dma_addr_t dest, int value,
 	struct hidma_desc *mdesc = NULL;
 	struct hidma_dev *mdma = mchan->dmadev;
 	unsigned long irqflags;
+	u64 byte_pattern, fill_pattern;
 
 	/* Get free descriptor */
 	spin_lock_irqsave(&mchan->lock, irqflags);
@@ -443,9 +443,19 @@ hidma_prep_dma_memset(struct dma_chan *dmach, dma_addr_t dest, int value,
 	if (!mdesc)
 		return NULL;
 
+	byte_pattern = (char)value;
+	fill_pattern =	(byte_pattern << 56) |
+			(byte_pattern << 48) |
+			(byte_pattern << 40) |
+			(byte_pattern << 32) |
+			(byte_pattern << 24) |
+			(byte_pattern << 16) |
+			(byte_pattern << 8) |
+			byte_pattern;
+
 	mdesc->desc.flags = flags;
 	hidma_ll_set_transfer_params(mdma->lldev, mdesc->tre_ch,
-				     value, dest, len, flags,
+				     fill_pattern, dest, len, flags,
 				     HIDMA_TRE_MEMSET);
 
 	/* Place descriptor in prepared list */
@@ -599,7 +609,7 @@ static irqreturn_t hidma_chirq_handler(int chirq, void *arg)
 	return hidma_ll_inthandler(chirq, lldev);
 }
 
-#ifdef CONFIG_GENERIC_MSI_IRQ_DOMAIN
+#ifdef CONFIG_GENERIC_MSI_IRQ
 static irqreturn_t hidma_chirq_handler_msi(int chirq, void *arg)
 {
 	struct hidma_lldev **lldevp = arg;
@@ -660,7 +670,7 @@ static int hidma_sysfs_init(struct hidma_dev *dev)
 	return device_create_file(dev->ddev.dev, dev->chid_attrs);
 }
 
-#ifdef CONFIG_GENERIC_MSI_IRQ_DOMAIN
+#ifdef CONFIG_GENERIC_MSI_IRQ
 static void hidma_write_msi_msg(struct msi_desc *desc, struct msi_msg *msg)
 {
 	struct device *dev = msi_desc_to_dev(desc);
@@ -676,7 +686,7 @@ static void hidma_write_msi_msg(struct msi_desc *desc, struct msi_msg *msg)
 
 static void hidma_free_msis(struct hidma_dev *dmadev)
 {
-#ifdef CONFIG_GENERIC_MSI_IRQ_DOMAIN
+#ifdef CONFIG_GENERIC_MSI_IRQ
 	struct device *dev = dmadev->ddev.dev;
 	int i, virq;
 
@@ -693,7 +703,7 @@ static void hidma_free_msis(struct hidma_dev *dmadev)
 static int hidma_request_msi(struct hidma_dev *dmadev,
 			     struct platform_device *pdev)
 {
-#ifdef CONFIG_GENERIC_MSI_IRQ_DOMAIN
+#ifdef CONFIG_GENERIC_MSI_IRQ
 	int rc, i, virq;
 
 	rc = platform_msi_domain_alloc_irqs(&pdev->dev, HIDMA_MSI_INTS,
@@ -755,17 +765,15 @@ static int hidma_probe(struct platform_device *pdev)
 	pm_runtime_set_active(&pdev->dev);
 	pm_runtime_enable(&pdev->dev);
 
-	trca_resource = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	trca = devm_ioremap_resource(&pdev->dev, trca_resource);
+	trca = devm_platform_get_and_ioremap_resource(pdev, 0, &trca_resource);
 	if (IS_ERR(trca)) {
-		rc = -ENOMEM;
+		rc = PTR_ERR(trca);
 		goto bailout;
 	}
 
-	evca_resource = platform_get_resource(pdev, IORESOURCE_MEM, 1);
-	evca = devm_ioremap_resource(&pdev->dev, evca_resource);
+	evca = devm_platform_get_and_ioremap_resource(pdev, 1, &evca_resource);
 	if (IS_ERR(evca)) {
-		rc = -ENOMEM;
+		rc = PTR_ERR(evca);
 		goto bailout;
 	}
 
@@ -775,7 +783,7 @@ static int hidma_probe(struct platform_device *pdev)
 	 */
 	chirq = platform_get_irq(pdev, 0);
 	if (chirq < 0) {
-		rc = -ENODEV;
+		rc = chirq;
 		goto bailout;
 	}
 
@@ -838,9 +846,7 @@ static int hidma_probe(struct platform_device *pdev)
 	rc = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	if (rc) {
 		dev_warn(&pdev->dev, "unable to set coherent mask to 64");
-		rc = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
-		if (rc)
-			goto dmafree;
+		goto dmafree;
 	}
 
 	dmadev->lldev = hidma_ll_init(dmadev->ddev.dev,

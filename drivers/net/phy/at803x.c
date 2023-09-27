@@ -13,12 +13,13 @@
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/ethtool_netlink.h>
-#include <linux/of_gpio.h>
 #include <linux/bitfield.h>
-#include <linux/gpio/consumer.h>
 #include <linux/regulator/of_regulator.h>
 #include <linux/regulator/driver.h>
 #include <linux/regulator/consumer.h>
+#include <linux/of.h>
+#include <linux/phylink.h>
+#include <linux/sfp.h>
 #include <dt-bindings/net/qca-ar803x.h>
 
 #define AT803X_SPECIFIC_FUNCTION_CONTROL	0x10
@@ -51,6 +52,8 @@
 #define AT803X_INTR_ENABLE_PAGE_RECEIVED	BIT(12)
 #define AT803X_INTR_ENABLE_LINK_FAIL		BIT(11)
 #define AT803X_INTR_ENABLE_LINK_SUCCESS		BIT(10)
+#define AT803X_INTR_ENABLE_LINK_FAIL_BX		BIT(8)
+#define AT803X_INTR_ENABLE_LINK_SUCCESS_BX	BIT(7)
 #define AT803X_INTR_ENABLE_WIRESPEED_DOWNGRADE	BIT(5)
 #define AT803X_INTR_ENABLE_POLARITY_CHANGED	BIT(1)
 #define AT803X_INTR_ENABLE_WOL			BIT(0)
@@ -85,7 +88,17 @@
 #define AT803X_DEBUG_DATA			0x1E
 
 #define AT803X_MODE_CFG_MASK			0x0F
-#define AT803X_MODE_CFG_SGMII			0x01
+#define AT803X_MODE_CFG_BASET_RGMII		0x00
+#define AT803X_MODE_CFG_BASET_SGMII		0x01
+#define AT803X_MODE_CFG_BX1000_RGMII_50OHM	0x02
+#define AT803X_MODE_CFG_BX1000_RGMII_75OHM	0x03
+#define AT803X_MODE_CFG_BX1000_CONV_50OHM	0x04
+#define AT803X_MODE_CFG_BX1000_CONV_75OHM	0x05
+#define AT803X_MODE_CFG_FX100_RGMII_50OHM	0x06
+#define AT803X_MODE_CFG_FX100_CONV_50OHM	0x07
+#define AT803X_MODE_CFG_RGMII_AUTO_MDET		0x0B
+#define AT803X_MODE_CFG_FX100_RGMII_75OHM	0x0E
+#define AT803X_MODE_CFG_FX100_CONV_75OHM	0x0F
 
 #define AT803X_PSSR				0x11	/*PHY-Specific Status Register*/
 #define AT803X_PSSR_MR_AN_COMPLETE		0x0200
@@ -101,6 +114,7 @@
 #define AT803X_DEBUG_REG_HIB_CTRL		0x0b
 #define   AT803X_DEBUG_HIB_CTRL_SEL_RST_80U	BIT(10)
 #define   AT803X_DEBUG_HIB_CTRL_EN_ANY_CHANGE	BIT(13)
+#define   AT803X_DEBUG_HIB_CTRL_PS_HIB_EN	BIT(15)
 
 #define AT803X_DEBUG_REG_3C			0x3C
 
@@ -177,6 +191,9 @@
 /* don't turn off internal PLL */
 #define AT803X_KEEP_PLL_ENABLED			BIT(0)
 #define AT803X_DISABLE_SMARTEEE			BIT(1)
+
+/* disable hibernation mode */
+#define AT803X_DISABLE_HIBERNATION_MODE		BIT(2)
 
 /* ADC threshold */
 #define QCA808X_PHY_DEBUG_ADC_THRESHOLD		0x2c80
@@ -255,6 +272,13 @@
 #define QCA808X_CDT_STATUS_STAT_OPEN		2
 #define QCA808X_CDT_STATUS_STAT_SHORT		3
 
+/* QCA808X 1G chip type */
+#define QCA808X_PHY_MMD7_CHIP_TYPE		0x901d
+#define QCA808X_PHY_CHIP_TYPE_1G		BIT(0)
+
+#define QCA8081_PHY_SERDES_MMD1_FIFO_CTRL	0x9072
+#define QCA8081_PHY_FIFO_RSTN			BIT(11)
+
 MODULE_DESCRIPTION("Qualcomm Atheros AR803x and QCA808X PHY driver");
 MODULE_AUTHOR("Matus Ujhelyi");
 MODULE_LICENSE("GPL");
@@ -283,9 +307,10 @@ struct at803x_priv {
 	u16 clk_25m_mask;
 	u8 smarteee_lpi_tw_1g;
 	u8 smarteee_lpi_tw_100m;
+	bool is_fiber;
+	bool is_1000basex;
 	struct regulator_dev *vddio_rdev;
 	struct regulator_dev *vddh_rdev;
-	struct regulator *vddio;
 	u64 stats[ARRAY_SIZE(at803x_hw_stats)];
 };
 
@@ -417,20 +442,21 @@ static void at803x_context_restore(struct phy_device *phydev,
 static int at803x_set_wol(struct phy_device *phydev,
 			  struct ethtool_wolinfo *wol)
 {
-	struct net_device *ndev = phydev->attached_dev;
-	const u8 *mac;
 	int ret, irq_enabled;
-	unsigned int i;
-	static const unsigned int offsets[] = {
-		AT803X_LOC_MAC_ADDR_32_47_OFFSET,
-		AT803X_LOC_MAC_ADDR_16_31_OFFSET,
-		AT803X_LOC_MAC_ADDR_0_15_OFFSET,
-	};
-
-	if (!ndev)
-		return -ENODEV;
 
 	if (wol->wolopts & WAKE_MAGIC) {
+		struct net_device *ndev = phydev->attached_dev;
+		const u8 *mac;
+		unsigned int i;
+		static const unsigned int offsets[] = {
+			AT803X_LOC_MAC_ADDR_32_47_OFFSET,
+			AT803X_LOC_MAC_ADDR_16_31_OFFSET,
+			AT803X_LOC_MAC_ADDR_0_15_OFFSET,
+		};
+
+		if (!ndev)
+			return -ENODEV;
+
 		mac = (const u8 *) ndev->dev_addr;
 
 		if (!is_valid_ether_addr(mac))
@@ -440,21 +466,27 @@ static int at803x_set_wol(struct phy_device *phydev,
 			phy_write_mmd(phydev, MDIO_MMD_PCS, offsets[i],
 				      mac[(i * 2) + 1] | (mac[(i * 2)] << 8));
 
-		/* Enable WOL function */
-		ret = phy_modify_mmd(phydev, MDIO_MMD_PCS, AT803X_PHY_MMD3_WOL_CTRL,
-				0, AT803X_WOL_EN);
-		if (ret)
-			return ret;
+		/* Enable WOL function for 1588 */
+		if (phydev->drv->phy_id == ATH8031_PHY_ID) {
+			ret = phy_modify_mmd(phydev, MDIO_MMD_PCS,
+					     AT803X_PHY_MMD3_WOL_CTRL,
+					     0, AT803X_WOL_EN);
+			if (ret)
+				return ret;
+		}
 		/* Enable WOL interrupt */
 		ret = phy_modify(phydev, AT803X_INTR_ENABLE, 0, AT803X_INTR_ENABLE_WOL);
 		if (ret)
 			return ret;
 	} else {
-		/* Disable WoL function */
-		ret = phy_modify_mmd(phydev, MDIO_MMD_PCS, AT803X_PHY_MMD3_WOL_CTRL,
-				AT803X_WOL_EN, 0);
-		if (ret)
-			return ret;
+		/* Disable WoL function for 1588 */
+		if (phydev->drv->phy_id == ATH8031_PHY_ID) {
+			ret = phy_modify_mmd(phydev, MDIO_MMD_PCS,
+					     AT803X_PHY_MMD3_WOL_CTRL,
+					     AT803X_WOL_EN, 0);
+			if (ret)
+				return ret;
+		}
 		/* Disable WOL interrupt */
 		ret = phy_modify(phydev, AT803X_INTR_ENABLE, AT803X_INTR_ENABLE_WOL, 0);
 		if (ret)
@@ -489,11 +521,11 @@ static void at803x_get_wol(struct phy_device *phydev,
 	wol->supported = WAKE_MAGIC;
 	wol->wolopts = 0;
 
-	value = phy_read_mmd(phydev, MDIO_MMD_PCS, AT803X_PHY_MMD3_WOL_CTRL);
+	value = phy_read(phydev, AT803X_INTR_ENABLE);
 	if (value < 0)
 		return;
 
-	if (value & AT803X_WOL_EN)
+	if (value & AT803X_INTR_ENABLE_WOL)
 		wol->wolopts |= WAKE_MAGIC;
 }
 
@@ -650,6 +682,56 @@ static int at8031_register_regulators(struct phy_device *phydev)
 	return 0;
 }
 
+static int at803x_sfp_insert(void *upstream, const struct sfp_eeprom_id *id)
+{
+	struct phy_device *phydev = upstream;
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(phy_support);
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(sfp_support);
+	DECLARE_PHY_INTERFACE_MASK(interfaces);
+	phy_interface_t iface;
+
+	linkmode_zero(phy_support);
+	phylink_set(phy_support, 1000baseX_Full);
+	phylink_set(phy_support, 1000baseT_Full);
+	phylink_set(phy_support, Autoneg);
+	phylink_set(phy_support, Pause);
+	phylink_set(phy_support, Asym_Pause);
+
+	linkmode_zero(sfp_support);
+	sfp_parse_support(phydev->sfp_bus, id, sfp_support, interfaces);
+	/* Some modules support 10G modes as well as others we support.
+	 * Mask out non-supported modes so the correct interface is picked.
+	 */
+	linkmode_and(sfp_support, phy_support, sfp_support);
+
+	if (linkmode_empty(sfp_support)) {
+		dev_err(&phydev->mdio.dev, "incompatible SFP module inserted\n");
+		return -EINVAL;
+	}
+
+	iface = sfp_select_interface(phydev->sfp_bus, sfp_support);
+
+	/* Only 1000Base-X is supported by AR8031/8033 as the downstream SerDes
+	 * interface for use with SFP modules.
+	 * However, some copper modules detected as having a preferred SGMII
+	 * interface do default to and function in 1000Base-X mode, so just
+	 * print a warning and allow such modules, as they may have some chance
+	 * of working.
+	 */
+	if (iface == PHY_INTERFACE_MODE_SGMII)
+		dev_warn(&phydev->mdio.dev, "module may not function if 1000Base-X not supported\n");
+	else if (iface != PHY_INTERFACE_MODE_1000BASEX)
+		return -EINVAL;
+
+	return 0;
+}
+
+static const struct sfp_upstream_ops at803x_sfp_ops = {
+	.attach = phy_sfp_attach,
+	.detach = phy_sfp_detach,
+	.module_insert = at803x_sfp_insert,
+};
+
 static int at803x_parse_dt(struct phy_device *phydev)
 {
 	struct device_node *node = phydev->mdio.dev.of_node;
@@ -663,6 +745,9 @@ static int at803x_parse_dt(struct phy_device *phydev)
 
 	if (of_property_read_bool(node, "qca,disable-smarteee"))
 		priv->flags |= AT803X_DISABLE_SMARTEEE;
+
+	if (of_property_read_bool(node, "qca,disable-hibernation-mode"))
+		priv->flags |= AT803X_DISABLE_HIBERNATION_MODE;
 
 	if (!of_property_read_u32(node, "qca,smarteee-tw-us-1g", &tw)) {
 		if (!tw || tw > 255) {
@@ -751,12 +836,17 @@ static int at803x_parse_dt(struct phy_device *phydev)
 		if (ret < 0)
 			return ret;
 
-		priv->vddio = devm_regulator_get_optional(&phydev->mdio.dev,
-							  "vddio");
-		if (IS_ERR(priv->vddio)) {
+		ret = devm_regulator_get_enable_optional(&phydev->mdio.dev,
+							 "vddio");
+		if (ret) {
 			phydev_err(phydev, "failed to get VDDIO regulator\n");
-			return PTR_ERR(priv->vddio);
+			return ret;
 		}
+
+		/* Only AR8031/8033 support 1000Base-X for SFP modules */
+		ret = phy_sfp_probe(phydev, &at803x_sfp_ops);
+		if (ret < 0)
+			return ret;
 	}
 
 	return 0;
@@ -778,57 +868,46 @@ static int at803x_probe(struct phy_device *phydev)
 	if (ret)
 		return ret;
 
-	if (priv->vddio) {
-		ret = regulator_enable(priv->vddio);
-		if (ret < 0)
+	if (phydev->drv->phy_id == ATH8031_PHY_ID) {
+		int ccr = phy_read(phydev, AT803X_REG_CHIP_CONFIG);
+		int mode_cfg;
+
+		if (ccr < 0)
+			return ccr;
+		mode_cfg = ccr & AT803X_MODE_CFG_MASK;
+
+		switch (mode_cfg) {
+		case AT803X_MODE_CFG_BX1000_RGMII_50OHM:
+		case AT803X_MODE_CFG_BX1000_RGMII_75OHM:
+			priv->is_1000basex = true;
+			fallthrough;
+		case AT803X_MODE_CFG_FX100_RGMII_50OHM:
+		case AT803X_MODE_CFG_FX100_RGMII_75OHM:
+			priv->is_fiber = true;
+			break;
+		}
+
+		/* Disable WoL in 1588 register which is enabled
+		 * by default
+		 */
+		ret = phy_modify_mmd(phydev, MDIO_MMD_PCS,
+				     AT803X_PHY_MMD3_WOL_CTRL,
+				     AT803X_WOL_EN, 0);
+		if (ret)
 			return ret;
 	}
 
-	/* Some bootloaders leave the fiber page selected.
-	 * Switch to the copper page, as otherwise we read
-	 * the PHY capabilities from the fiber side.
-	 */
-	if (phydev->drv->phy_id == ATH8031_PHY_ID) {
-		phy_lock_mdio_bus(phydev);
-		ret = at803x_write_page(phydev, AT803X_PAGE_COPPER);
-		phy_unlock_mdio_bus(phydev);
-		if (ret)
-			goto err;
-	}
-
 	return 0;
-
-err:
-	if (priv->vddio)
-		regulator_disable(priv->vddio);
-
-	return ret;
-}
-
-static void at803x_remove(struct phy_device *phydev)
-{
-	struct at803x_priv *priv = phydev->priv;
-
-	if (priv->vddio)
-		regulator_disable(priv->vddio);
 }
 
 static int at803x_get_features(struct phy_device *phydev)
 {
+	struct at803x_priv *priv = phydev->priv;
 	int err;
 
 	err = genphy_read_abilities(phydev);
 	if (err)
 		return err;
-
-	if (phydev->drv->phy_id == QCA8081_PHY_ID) {
-		err = phy_read_mmd(phydev, MDIO_MMD_PMAPMD, MDIO_PMA_NG_EXTABLE);
-		if (err < 0)
-			return err;
-
-		linkmode_mod_bit(ETHTOOL_LINK_MODE_2500baseT_Full_BIT, phydev->supported,
-				err & MDIO_PMA_NG_EXTABLE_2_5GBT);
-	}
 
 	if (phydev->drv->phy_id != ATH8031_PHY_ID)
 		return 0;
@@ -841,12 +920,13 @@ static int at803x_get_features(struct phy_device *phydev)
 	 * As a result of that, ESTATUS_1000_XFULL is set
 	 * to 1 even when operating in copper TP mode.
 	 *
-	 * Remove this mode from the supported link modes,
-	 * as this driver currently only supports copper
-	 * operation.
+	 * Remove this mode from the supported link modes
+	 * when not operating in 1000BaseX mode.
 	 */
-	linkmode_clear_bit(ETHTOOL_LINK_MODE_1000baseX_Full_BIT,
-			   phydev->supported);
+	if (!priv->is_1000basex)
+		linkmode_clear_bit(ETHTOOL_LINK_MODE_1000baseX_Full_BIT,
+				   phydev->supported);
+
 	return 0;
 }
 
@@ -908,9 +988,42 @@ static int at8031_pll_config(struct phy_device *phydev)
 					     AT803X_DEBUG_PLL_ON, 0);
 }
 
+static int at803x_hibernation_mode_config(struct phy_device *phydev)
+{
+	struct at803x_priv *priv = phydev->priv;
+
+	/* The default after hardware reset is hibernation mode enabled. After
+	 * software reset, the value is retained.
+	 */
+	if (!(priv->flags & AT803X_DISABLE_HIBERNATION_MODE))
+		return 0;
+
+	return at803x_debug_reg_mask(phydev, AT803X_DEBUG_REG_HIB_CTRL,
+					 AT803X_DEBUG_HIB_CTRL_PS_HIB_EN, 0);
+}
+
 static int at803x_config_init(struct phy_device *phydev)
 {
+	struct at803x_priv *priv = phydev->priv;
 	int ret;
+
+	if (phydev->drv->phy_id == ATH8031_PHY_ID) {
+		/* Some bootloaders leave the fiber page selected.
+		 * Switch to the appropriate page (fiber or copper), as otherwise we
+		 * read the PHY capabilities from the wrong page.
+		 */
+		phy_lock_mdio_bus(phydev);
+		ret = at803x_write_page(phydev,
+					priv->is_fiber ? AT803X_PAGE_FIBER :
+							 AT803X_PAGE_COPPER);
+		phy_unlock_mdio_bus(phydev);
+		if (ret)
+			return ret;
+
+		ret = at8031_pll_config(phydev);
+		if (ret < 0)
+			return ret;
+	}
 
 	/* The RX and TX delay default is:
 	 *   after HW reset: RX delay enabled and TX delay disabled
@@ -941,11 +1054,9 @@ static int at803x_config_init(struct phy_device *phydev)
 	if (ret < 0)
 		return ret;
 
-	if (phydev->drv->phy_id == ATH8031_PHY_ID) {
-		ret = at8031_pll_config(phydev);
-		if (ret < 0)
-			return ret;
-	}
+	ret = at803x_hibernation_mode_config(phydev);
+	if (ret < 0)
+		return ret;
 
 	/* Ar803x extended next page bit is enabled by default. Cisco
 	 * multigig switches read this bit and attempt to negotiate 10Gbps
@@ -967,6 +1078,7 @@ static int at803x_ack_interrupt(struct phy_device *phydev)
 
 static int at803x_config_intr(struct phy_device *phydev)
 {
+	struct at803x_priv *priv = phydev->priv;
 	int err;
 	int value;
 
@@ -983,6 +1095,10 @@ static int at803x_config_intr(struct phy_device *phydev)
 		value |= AT803X_INTR_ENABLE_DUPLEX_CHANGED;
 		value |= AT803X_INTR_ENABLE_LINK_FAIL;
 		value |= AT803X_INTR_ENABLE_LINK_SUCCESS;
+		if (priv->is_fiber) {
+			value |= AT803X_INTR_ENABLE_LINK_FAIL_BX;
+			value |= AT803X_INTR_ENABLE_LINK_SUCCESS_BX;
+		}
 
 		err = phy_write(phydev, AT803X_INTR_ENABLE, value);
 	} else {
@@ -1115,7 +1231,11 @@ static int at803x_read_specific_status(struct phy_device *phydev)
 
 static int at803x_read_status(struct phy_device *phydev)
 {
+	struct at803x_priv *priv = phydev->priv;
 	int err, old_link = phydev->link;
+
+	if (priv->is_1000basex)
+		return genphy_c37_read_status(phydev);
 
 	/* Update the link, but return if there was an error */
 	err = genphy_update_link(phydev);
@@ -1170,6 +1290,7 @@ static int at803x_config_mdix(struct phy_device *phydev, u8 ctrl)
 
 static int at803x_config_aneg(struct phy_device *phydev)
 {
+	struct at803x_priv *priv = phydev->priv;
 	int ret;
 
 	ret = at803x_config_mdix(phydev, phydev->mdix_ctrl);
@@ -1185,6 +1306,9 @@ static int at803x_config_aneg(struct phy_device *phydev)
 		if (ret < 0)
 			return ret;
 	}
+
+	if (priv->is_1000basex)
+		return genphy_c37_config_aneg(phydev);
 
 	/* Do not restart auto-negotiation by setting ret to 0 defautly,
 	 * when calling __genphy_config_aneg later.
@@ -1613,24 +1737,30 @@ static int qca808x_phy_fast_retrain_config(struct phy_device *phydev)
 	return 0;
 }
 
-static int qca808x_phy_ms_random_seed_set(struct phy_device *phydev)
-{
-	u16 seed_value = (prandom_u32() % QCA808X_MASTER_SLAVE_SEED_RANGE);
-
-	return at803x_debug_reg_mask(phydev, QCA808X_PHY_DEBUG_LOCAL_SEED,
-			QCA808X_MASTER_SLAVE_SEED_CFG,
-			FIELD_PREP(QCA808X_MASTER_SLAVE_SEED_CFG, seed_value));
-}
-
 static int qca808x_phy_ms_seed_enable(struct phy_device *phydev, bool enable)
 {
-	u16 seed_enable = 0;
+	u16 seed_value;
 
-	if (enable)
-		seed_enable = QCA808X_MASTER_SLAVE_SEED_ENABLE;
+	if (!enable)
+		return at803x_debug_reg_mask(phydev, QCA808X_PHY_DEBUG_LOCAL_SEED,
+				QCA808X_MASTER_SLAVE_SEED_ENABLE, 0);
 
+	seed_value = get_random_u32_below(QCA808X_MASTER_SLAVE_SEED_RANGE);
 	return at803x_debug_reg_mask(phydev, QCA808X_PHY_DEBUG_LOCAL_SEED,
-			QCA808X_MASTER_SLAVE_SEED_ENABLE, seed_enable);
+			QCA808X_MASTER_SLAVE_SEED_CFG | QCA808X_MASTER_SLAVE_SEED_ENABLE,
+			FIELD_PREP(QCA808X_MASTER_SLAVE_SEED_CFG, seed_value) |
+			QCA808X_MASTER_SLAVE_SEED_ENABLE);
+}
+
+static bool qca808x_is_prefer_master(struct phy_device *phydev)
+{
+	return (phydev->master_slave_get == MASTER_SLAVE_CFG_MASTER_FORCE) ||
+		(phydev->master_slave_get == MASTER_SLAVE_CFG_MASTER_PREFERRED);
+}
+
+static bool qca808x_has_fast_retrain_or_slave_seed(struct phy_device *phydev)
+{
+	return linkmode_test_bit(ETHTOOL_LINK_MODE_2500baseT_Full_BIT, phydev->supported);
 }
 
 static int qca808x_config_init(struct phy_device *phydev)
@@ -1649,20 +1779,25 @@ static int qca808x_config_init(struct phy_device *phydev)
 	if (ret)
 		return ret;
 
-	/* Config the fast retrain for the link 2500M */
-	ret = qca808x_phy_fast_retrain_config(phydev);
-	if (ret)
-		return ret;
+	if (qca808x_has_fast_retrain_or_slave_seed(phydev)) {
+		/* Config the fast retrain for the link 2500M */
+		ret = qca808x_phy_fast_retrain_config(phydev);
+		if (ret)
+			return ret;
 
-	/* Configure lower ramdom seed to make phy linked as slave mode */
-	ret = qca808x_phy_ms_random_seed_set(phydev);
-	if (ret)
-		return ret;
+		ret = genphy_read_master_slave(phydev);
+		if (ret < 0)
+			return ret;
 
-	/* Enable seed */
-	ret = qca808x_phy_ms_seed_enable(phydev, true);
-	if (ret)
-		return ret;
+		if (!qca808x_is_prefer_master(phydev)) {
+			/* Enable seed and configure lower ramdom seed to make phy
+			 * linked as slave mode.
+			 */
+			ret = qca808x_phy_ms_seed_enable(phydev, true);
+			if (ret)
+				return ret;
+		}
+	}
 
 	/* Configure adc threshold as 100mv for the link 10M */
 	return at803x_debug_reg_mask(phydev, QCA808X_PHY_DEBUG_ADC_THRESHOLD,
@@ -1695,17 +1830,21 @@ static int qca808x_read_status(struct phy_device *phydev)
 			phydev->interface = PHY_INTERFACE_MODE_SGMII;
 	} else {
 		/* generate seed as a lower random value to make PHY linked as SLAVE easily,
-		 * except for master/slave configuration fault detected.
+		 * except for master/slave configuration fault detected or the master mode
+		 * preferred.
+		 *
 		 * the reason for not putting this code into the function link_change_notify is
 		 * the corner case where the link partner is also the qca8081 PHY and the seed
 		 * value is configured as the same value, the link can't be up and no link change
 		 * occurs.
 		 */
-		if (phydev->master_slave_state == MASTER_SLAVE_STATE_ERR) {
-			qca808x_phy_ms_seed_enable(phydev, false);
-		} else {
-			qca808x_phy_ms_random_seed_set(phydev);
-			qca808x_phy_ms_seed_enable(phydev, true);
+		if (qca808x_has_fast_retrain_or_slave_seed(phydev)) {
+			if (phydev->master_slave_state == MASTER_SLAVE_STATE_ERR ||
+					qca808x_is_prefer_master(phydev)) {
+				qca808x_phy_ms_seed_enable(phydev, false);
+			} else {
+				qca808x_phy_ms_seed_enable(phydev, true);
+			}
 		}
 	}
 
@@ -1720,7 +1859,10 @@ static int qca808x_soft_reset(struct phy_device *phydev)
 	if (ret < 0)
 		return ret;
 
-	return qca808x_phy_ms_seed_enable(phydev, true);
+	if (qca808x_has_fast_retrain_or_slave_seed(phydev))
+		ret = qca808x_phy_ms_seed_enable(phydev, true);
+
+	return ret;
 }
 
 static bool qca808x_cdt_fault_length_valid(int cdt_code)
@@ -1870,6 +2012,44 @@ static int qca808x_cable_test_get_status(struct phy_device *phydev, bool *finish
 	return 0;
 }
 
+static int qca808x_get_features(struct phy_device *phydev)
+{
+	int ret;
+
+	ret = genphy_c45_pma_read_abilities(phydev);
+	if (ret)
+		return ret;
+
+	/* The autoneg ability is not existed in bit3 of MMD7.1,
+	 * but it is supported by qca808x PHY, so we add it here
+	 * manually.
+	 */
+	linkmode_set_bit(ETHTOOL_LINK_MODE_Autoneg_BIT, phydev->supported);
+
+	/* As for the qca8081 1G version chip, the 2500baseT ability is also
+	 * existed in the bit0 of MMD1.21, we need to remove it manually if
+	 * it is the qca8081 1G chip according to the bit0 of MMD7.0x901d.
+	 */
+	ret = phy_read_mmd(phydev, MDIO_MMD_AN, QCA808X_PHY_MMD7_CHIP_TYPE);
+	if (ret < 0)
+		return ret;
+
+	if (QCA808X_PHY_CHIP_TYPE_1G & ret)
+		linkmode_clear_bit(ETHTOOL_LINK_MODE_2500baseT_Full_BIT, phydev->supported);
+
+	return 0;
+}
+
+static void qca808x_link_change_notify(struct phy_device *phydev)
+{
+	/* Assert interface sgmii fifo on link down, deassert it on link up,
+	 * the interface device address is always phy address added by 1.
+	 */
+	mdiobus_c45_modify_changed(phydev->mdio.bus, phydev->mdio.addr + 1,
+			MDIO_MMD_PMAPMD, QCA8081_PHY_SERDES_MMD1_FIFO_CTRL,
+			QCA8081_PHY_FIFO_RSTN, phydev->link ? QCA8081_PHY_FIFO_RSTN : 0);
+}
+
 static struct phy_driver at803x_driver[] = {
 {
 	/* Qualcomm Atheros AR8035 */
@@ -1877,7 +2057,6 @@ static struct phy_driver at803x_driver[] = {
 	.name			= "Qualcomm Atheros AR8035",
 	.flags			= PHY_POLL_CABLE_TEST,
 	.probe			= at803x_probe,
-	.remove			= at803x_remove,
 	.config_aneg		= at803x_config_aneg,
 	.config_init		= at803x_config_init,
 	.soft_reset		= genphy_soft_reset,
@@ -1899,7 +2078,6 @@ static struct phy_driver at803x_driver[] = {
 	.name			= "Qualcomm Atheros AR8030",
 	.phy_id_mask		= AT8030_PHY_ID_MASK,
 	.probe			= at803x_probe,
-	.remove			= at803x_remove,
 	.config_init		= at803x_config_init,
 	.link_change_notify	= at803x_link_change_notify,
 	.set_wol		= at803x_set_wol,
@@ -1915,7 +2093,6 @@ static struct phy_driver at803x_driver[] = {
 	.name			= "Qualcomm Atheros AR8031/AR8033",
 	.flags			= PHY_POLL_CABLE_TEST,
 	.probe			= at803x_probe,
-	.remove			= at803x_remove,
 	.config_init		= at803x_config_init,
 	.config_aneg		= at803x_config_aneg,
 	.soft_reset		= genphy_soft_reset,
@@ -1938,12 +2115,9 @@ static struct phy_driver at803x_driver[] = {
 	PHY_ID_MATCH_EXACT(ATH8032_PHY_ID),
 	.name			= "Qualcomm Atheros AR8032",
 	.probe			= at803x_probe,
-	.remove			= at803x_remove,
 	.flags			= PHY_POLL_CABLE_TEST,
 	.config_init		= at803x_config_init,
 	.link_change_notify	= at803x_link_change_notify,
-	.set_wol		= at803x_set_wol,
-	.get_wol		= at803x_get_wol,
 	.suspend		= at803x_suspend,
 	.resume			= at803x_resume,
 	/* PHY_BASIC_FEATURES */
@@ -1955,6 +2129,7 @@ static struct phy_driver at803x_driver[] = {
 	/* ATHEROS AR9331 */
 	PHY_ID_MATCH_EXACT(ATH9331_PHY_ID),
 	.name			= "Qualcomm Atheros AR9331 built-in PHY",
+	.probe			= at803x_probe,
 	.suspend		= at803x_suspend,
 	.resume			= at803x_resume,
 	.flags			= PHY_POLL_CABLE_TEST,
@@ -1970,6 +2145,7 @@ static struct phy_driver at803x_driver[] = {
 	/* Qualcomm Atheros QCA9561 */
 	PHY_ID_MATCH_EXACT(QCA9561_PHY_ID),
 	.name			= "Qualcomm Atheros QCA9561 built-in PHY",
+	.probe			= at803x_probe,
 	.suspend		= at803x_suspend,
 	.resume			= at803x_resume,
 	.flags			= PHY_POLL_CABLE_TEST,
@@ -2034,13 +2210,14 @@ static struct phy_driver at803x_driver[] = {
 	PHY_ID_MATCH_EXACT(QCA8081_PHY_ID),
 	.name			= "Qualcomm QCA8081",
 	.flags			= PHY_POLL_CABLE_TEST,
+	.probe			= at803x_probe,
 	.config_intr		= at803x_config_intr,
 	.handle_interrupt	= at803x_handle_interrupt,
 	.get_tunable		= at803x_get_tunable,
 	.set_tunable		= at803x_set_tunable,
 	.set_wol		= at803x_set_wol,
 	.get_wol		= at803x_get_wol,
-	.get_features		= at803x_get_features,
+	.get_features		= qca808x_get_features,
 	.config_aneg		= at803x_config_aneg,
 	.suspend		= genphy_suspend,
 	.resume			= genphy_resume,
@@ -2049,6 +2226,7 @@ static struct phy_driver at803x_driver[] = {
 	.soft_reset		= qca808x_soft_reset,
 	.cable_test_start	= qca808x_cable_test_start,
 	.cable_test_get_status	= qca808x_cable_test_get_status,
+	.link_change_notify	= qca808x_link_change_notify,
 }, };
 
 module_phy_driver(at803x_driver);

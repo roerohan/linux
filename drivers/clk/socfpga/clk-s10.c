@@ -1,11 +1,10 @@
-// SPDX-License-Identifier:	GPL-2.0
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (C) 2017, Intel Corporation
  */
 #include <linux/slab.h>
 #include <linux/clk-provider.h>
-#include <linux/of_device.h>
-#include <linux/of_address.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 
 #include <dt-bindings/clock/stratix10-clock.h>

@@ -20,9 +20,6 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/of.h>
-#include <linux/of_address.h>
-#include <linux/of_device.h>
-#include <linux/of_platform.h>
 #include <linux/clk.h>
 #include <linux/pm_runtime.h>
 
@@ -203,8 +200,7 @@ static int ulite_transmit(struct uart_port *port, int stat)
 		return 0;
 
 	uart_out32(xmit->buf[xmit->tail], ULITE_TX, port);
-	xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE-1);
-	port->icount.tx++;
+	uart_xmit_advance(port, 1);
 
 	/* wake up */
 	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
@@ -314,14 +310,16 @@ static void ulite_shutdown(struct uart_port *port)
 	clk_disable(pdata->clk);
 }
 
-static void ulite_set_termios(struct uart_port *port, struct ktermios *termios,
-			      struct ktermios *old)
+static void ulite_set_termios(struct uart_port *port,
+			      struct ktermios *termios,
+			      const struct ktermios *old)
 {
 	unsigned long flags;
 	struct uartlite_data *pdata = port->private_data;
 
 	/* Set termios to what the hardware supports */
-	termios->c_cflag &= ~(BRKINT | CSTOPB | PARENB | PARODD | CSIZE);
+	termios->c_iflag &= ~BRKINT;
+	termios->c_cflag &= ~(CSTOPB | PARENB | PARODD | CSIZE);
 	termios->c_cflag |= pdata->cflags & (PARENB | PARODD | CSIZE);
 	tty_termios_encode_baud_rate(termios, pdata->baud, pdata->baud);
 
@@ -482,7 +480,7 @@ static void ulite_console_wait_tx(struct uart_port *port)
 			 "timeout waiting for TX buffer empty\n");
 }
 
-static void ulite_console_putchar(struct uart_port *port, int ch)
+static void ulite_console_putchar(struct uart_port *port, unsigned char ch)
 {
 	ulite_console_wait_tx(port);
 	uart_out32(ch, ULITE_TX, port);
@@ -558,7 +556,7 @@ static struct console ulite_console = {
 	.data	= &ulite_uart_driver,
 };
 
-static void early_uartlite_putc(struct uart_port *port, int c)
+static void early_uartlite_putc(struct uart_port *port, unsigned char c)
 {
 	/*
 	 * Limit how many times we'll spin waiting for TX FIFO status.
@@ -684,18 +682,15 @@ static int ulite_assign(struct device *dev, int id, phys_addr_t base, int irq,
  *
  * @dev: pointer to device structure
  */
-static int ulite_release(struct device *dev)
+static void ulite_release(struct device *dev)
 {
 	struct uart_port *port = dev_get_drvdata(dev);
-	int rc = 0;
 
 	if (port) {
-		rc = uart_remove_one_port(&ulite_uart_driver, port);
+		uart_remove_one_port(&ulite_uart_driver, port);
 		dev_set_drvdata(dev, NULL);
 		port->mapbase = 0;
 	}
-
-	return rc;
 }
 
 /**
@@ -899,14 +894,13 @@ static int ulite_remove(struct platform_device *pdev)
 {
 	struct uart_port *port = dev_get_drvdata(&pdev->dev);
 	struct uartlite_data *pdata = port->private_data;
-	int rc;
 
 	clk_disable_unprepare(pdata->clk);
-	rc = ulite_release(&pdev->dev);
+	ulite_release(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
 	pm_runtime_set_suspended(&pdev->dev);
 	pm_runtime_dont_use_autosuspend(&pdev->dev);
-	return rc;
+	return 0;
 }
 
 /* work with hotplug and coldplug */

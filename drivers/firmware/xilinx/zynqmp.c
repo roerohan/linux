@@ -2,9 +2,9 @@
 /*
  * Xilinx Zynq MPSoC Firmware layer
  *
- *  Copyright (C) 2014-2021 Xilinx, Inc.
+ *  Copyright (C) 2014-2022 Xilinx, Inc.
  *
- *  Michal Simek <michal.simek@xilinx.com>
+ *  Michal Simek <michal.simek@amd.com>
  *  Davorin Mista <davorin.mista@aggios.com>
  *  Jolly Shah <jollys@xilinx.com>
  *  Rajan Vaja <rajanv@xilinx.com>
@@ -18,6 +18,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
+#include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/hashtable.h>
@@ -36,10 +37,28 @@
 /* BOOT_PIN_CTRL_MASK- out_val[11:8], out_en[3:0] */
 #define CRL_APB_BOOTPIN_CTRL_MASK	0xF0FU
 
+/* IOCTL/QUERY feature payload size */
+#define FEATURE_PAYLOAD_SIZE		2
+
+/* Firmware feature check version mask */
+#define FIRMWARE_VERSION_MASK		GENMASK(15, 0)
+
 static bool feature_check_enabled;
 static DEFINE_HASHTABLE(pm_api_features_map, PM_API_FEATURE_CHECK_MAX_ORDER);
+static u32 ioctl_features[FEATURE_PAYLOAD_SIZE];
+static u32 query_features[FEATURE_PAYLOAD_SIZE];
 
 static struct platform_device *em_dev;
+
+/**
+ * struct zynqmp_devinfo - Structure for Zynqmp device instance
+ * @dev:		Device Pointer
+ * @feature_conf_id:	Feature conf id
+ */
+struct zynqmp_devinfo {
+	struct device *dev;
+	u32 feature_conf_id;
+};
 
 /**
  * struct pm_api_feature_data - PM API Feature data
@@ -157,35 +176,11 @@ static noinline int do_fw_call_hvc(u64 arg0, u64 arg1, u64 arg2,
 	return zynqmp_pm_ret_code((enum pm_ret_status)res.a0);
 }
 
-/**
- * zynqmp_pm_feature() - Check weather given feature is supported or not
- * @api_id:		API ID to check
- *
- * Return: Returns status, either success or error+reason
- */
-int zynqmp_pm_feature(const u32 api_id)
+static int __do_feature_check_call(const u32 api_id, u32 *ret_payload)
 {
 	int ret;
-	u32 ret_payload[PAYLOAD_ARG_CNT];
 	u64 smc_arg[2];
-	struct pm_api_feature_data *feature_data;
 
-	if (!feature_check_enabled)
-		return 0;
-
-	/* Check for existing entry in hash table for given api */
-	hash_for_each_possible(pm_api_features_map, feature_data, hentry,
-			       api_id) {
-		if (feature_data->pm_api_id == api_id)
-			return feature_data->feature_status;
-	}
-
-	/* Add new entry if not present */
-	feature_data = kmalloc(sizeof(*feature_data), GFP_KERNEL);
-	if (!feature_data)
-		return -ENOMEM;
-
-	feature_data->pm_api_id = api_id;
 	smc_arg[0] = PM_SIP_SVC | PM_FEATURE_CHECK;
 	smc_arg[1] = api_id;
 
@@ -195,12 +190,106 @@ int zynqmp_pm_feature(const u32 api_id)
 	else
 		ret = ret_payload[1];
 
+	return ret;
+}
+
+static int do_feature_check_call(const u32 api_id)
+{
+	int ret;
+	u32 ret_payload[PAYLOAD_ARG_CNT];
+	struct pm_api_feature_data *feature_data;
+
+	/* Check for existing entry in hash table for given api */
+	hash_for_each_possible(pm_api_features_map, feature_data, hentry,
+			       api_id) {
+		if (feature_data->pm_api_id == api_id)
+			return feature_data->feature_status;
+	}
+
+	/* Add new entry if not present */
+	feature_data = kmalloc(sizeof(*feature_data), GFP_ATOMIC);
+	if (!feature_data)
+		return -ENOMEM;
+
+	feature_data->pm_api_id = api_id;
+	ret = __do_feature_check_call(api_id, ret_payload);
+
 	feature_data->feature_status = ret;
 	hash_add(pm_api_features_map, &feature_data->hentry, api_id);
+
+	if (api_id == PM_IOCTL)
+		/* Store supported IOCTL IDs mask */
+		memcpy(ioctl_features, &ret_payload[2], FEATURE_PAYLOAD_SIZE * 4);
+	else if (api_id == PM_QUERY_DATA)
+		/* Store supported QUERY IDs mask */
+		memcpy(query_features, &ret_payload[2], FEATURE_PAYLOAD_SIZE * 4);
 
 	return ret;
 }
 EXPORT_SYMBOL_GPL(zynqmp_pm_feature);
+
+/**
+ * zynqmp_pm_feature() - Check whether given feature is supported or not and
+ *			 store supported IOCTL/QUERY ID mask
+ * @api_id:		API ID to check
+ *
+ * Return: Returns status, either success or error+reason
+ */
+int zynqmp_pm_feature(const u32 api_id)
+{
+	int ret;
+
+	if (!feature_check_enabled)
+		return 0;
+
+	ret = do_feature_check_call(api_id);
+
+	return ret;
+}
+
+/**
+ * zynqmp_pm_is_function_supported() - Check whether given IOCTL/QUERY function
+ *				       is supported or not
+ * @api_id:		PM_IOCTL or PM_QUERY_DATA
+ * @id:			IOCTL or QUERY function IDs
+ *
+ * Return: Returns status, either success or error+reason
+ */
+int zynqmp_pm_is_function_supported(const u32 api_id, const u32 id)
+{
+	int ret;
+	u32 *bit_mask;
+
+	/* Input arguments validation */
+	if (id >= 64 || (api_id != PM_IOCTL && api_id != PM_QUERY_DATA))
+		return -EINVAL;
+
+	/* Check feature check API version */
+	ret = do_feature_check_call(PM_FEATURE_CHECK);
+	if (ret < 0)
+		return ret;
+
+	/* Check if feature check version 2 is supported or not */
+	if ((ret & FIRMWARE_VERSION_MASK) == PM_API_VERSION_2) {
+		/*
+		 * Call feature check for IOCTL/QUERY API to get IOCTL ID or
+		 * QUERY ID feature status.
+		 */
+		ret = do_feature_check_call(api_id);
+		if (ret < 0)
+			return ret;
+
+		bit_mask = (api_id == PM_IOCTL) ? ioctl_features : query_features;
+
+		if ((bit_mask[(id / 32)] & BIT((id % 32))) == 0U)
+			return -EOPNOTSUPP;
+	} else {
+		return -ENODATA;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(zynqmp_pm_is_function_supported);
 
 /**
  * zynqmp_pm_invoke_fn() - Invoke the system-level platform management layer
@@ -251,6 +340,22 @@ int zynqmp_pm_invoke_fn(u32 pm_api_id, u32 arg0, u32 arg1,
 
 static u32 pm_api_version;
 static u32 pm_tz_version;
+static u32 pm_family_code;
+static u32 pm_sub_family_code;
+
+int zynqmp_pm_register_sgi(u32 sgi_num, u32 reset)
+{
+	int ret;
+
+	ret = zynqmp_pm_invoke_fn(TF_A_PM_REGISTER_SGI, sgi_num, reset, 0, 0,
+				  NULL);
+	if (!ret)
+		return ret;
+
+	/* try old implementation as fallback strategy if above fails */
+	return zynqmp_pm_invoke_fn(PM_IOCTL, 0, IOCTL_REGISTER_SGI, sgi_num,
+				   reset, NULL);
+}
 
 /**
  * zynqmp_pm_get_api_version() - Get version number of PMU PM firmware
@@ -301,6 +406,39 @@ int zynqmp_pm_get_chipid(u32 *idcode, u32 *version)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(zynqmp_pm_get_chipid);
+
+/**
+ * zynqmp_pm_get_family_info() - Get family info of platform
+ * @family:	Returned family code value
+ * @subfamily:	Returned sub-family code value
+ *
+ * Return: Returns status, either success or error+reason
+ */
+static int zynqmp_pm_get_family_info(u32 *family, u32 *subfamily)
+{
+	u32 ret_payload[PAYLOAD_ARG_CNT];
+	u32 idcode;
+	int ret;
+
+	/* Check is family or sub-family code already received */
+	if (pm_family_code && pm_sub_family_code) {
+		*family = pm_family_code;
+		*subfamily = pm_sub_family_code;
+		return 0;
+	}
+
+	ret = zynqmp_pm_invoke_fn(PM_GET_CHIPID, 0, 0, 0, 0, ret_payload);
+	if (ret < 0)
+		return ret;
+
+	idcode = ret_payload[1];
+	pm_family_code = FIELD_GET(FAMILY_CODE_MASK, idcode);
+	pm_sub_family_code = FIELD_GET(SUB_FAMILY_CODE_MASK, idcode);
+	*family = pm_family_code;
+	*subfamily = pm_sub_family_code;
+
+	return 0;
+}
 
 /**
  * zynqmp_pm_get_trustzone_version() - Get secure trustzone firmware version
@@ -636,8 +774,31 @@ EXPORT_SYMBOL_GPL(zynqmp_pm_get_pll_frac_data);
  */
 int zynqmp_pm_set_sd_tapdelay(u32 node_id, u32 type, u32 value)
 {
-	return zynqmp_pm_invoke_fn(PM_IOCTL, node_id, IOCTL_SET_SD_TAPDELAY,
-				   type, value, NULL);
+	u32 reg = (type == PM_TAPDELAY_INPUT) ? SD_ITAPDLY : SD_OTAPDLYSEL;
+	u32 mask = (node_id == NODE_SD_0) ? GENMASK(15, 0) : GENMASK(31, 16);
+
+	if (value) {
+		return zynqmp_pm_invoke_fn(PM_IOCTL, node_id,
+					   IOCTL_SET_SD_TAPDELAY,
+					   type, value, NULL);
+	}
+
+	/*
+	 * Work around completely misdesigned firmware API on Xilinx ZynqMP.
+	 * The IOCTL_SET_SD_TAPDELAY firmware call allows the caller to only
+	 * ever set IOU_SLCR SD_ITAPDLY Register SD0_ITAPDLYENA/SD1_ITAPDLYENA
+	 * bits, but there is no matching call to clear those bits. If those
+	 * bits are not cleared, SDMMC tuning may fail.
+	 *
+	 * Luckily, there are PM_MMIO_READ/PM_MMIO_WRITE calls which seem to
+	 * allow complete unrestricted access to all address space, including
+	 * IOU_SLCR SD_ITAPDLY Register and all the other registers, access
+	 * to which was supposed to be protected by the current firmware API.
+	 *
+	 * Use PM_MMIO_READ/PM_MMIO_WRITE to re-implement the missing counter
+	 * part of IOCTL_SET_SD_TAPDELAY which clears SDx_ITAPDLYENA bits.
+	 */
+	return zynqmp_pm_invoke_fn(PM_MMIO_WRITE, reg, mask, 0, 0, NULL);
 }
 EXPORT_SYMBOL_GPL(zynqmp_pm_set_sd_tapdelay);
 
@@ -741,6 +902,13 @@ int zynqmp_pm_read_pggs(u32 index, u32 *value)
 }
 EXPORT_SYMBOL_GPL(zynqmp_pm_read_pggs);
 
+int zynqmp_pm_set_tapdelay_bypass(u32 index, u32 value)
+{
+	return zynqmp_pm_invoke_fn(PM_IOCTL, 0, IOCTL_SET_TAPDELAY_BYPASS,
+				   index, value, NULL);
+}
+EXPORT_SYMBOL_GPL(zynqmp_pm_set_tapdelay_bypass);
+
 /**
  * zynqmp_pm_set_boot_health_status() - PM API for setting healthy boot status
  * @value:	Status value to be written
@@ -810,8 +978,16 @@ EXPORT_SYMBOL_GPL(zynqmp_pm_reset_get_status);
  */
 int zynqmp_pm_fpga_load(const u64 address, const u32 size, const u32 flags)
 {
-	return zynqmp_pm_invoke_fn(PM_FPGA_LOAD, lower_32_bits(address),
-				   upper_32_bits(address), size, flags, NULL);
+	u32 ret_payload[PAYLOAD_ARG_CNT];
+	int ret;
+
+	ret = zynqmp_pm_invoke_fn(PM_FPGA_LOAD, lower_32_bits(address),
+				  upper_32_bits(address), size, flags,
+				  ret_payload);
+	if (ret_payload[0])
+		return -ret_payload[0];
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(zynqmp_pm_fpga_load);
 
@@ -838,6 +1014,39 @@ int zynqmp_pm_fpga_get_status(u32 *value)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(zynqmp_pm_fpga_get_status);
+
+/**
+ * zynqmp_pm_fpga_get_config_status - Get the FPGA configuration status.
+ * @value: Buffer to store FPGA configuration status.
+ *
+ * This function provides access to the pmufw to get the FPGA configuration
+ * status
+ *
+ * Return: 0 on success, a negative value on error
+ */
+int zynqmp_pm_fpga_get_config_status(u32 *value)
+{
+	u32 ret_payload[PAYLOAD_ARG_CNT];
+	u32 buf, lower_addr, upper_addr;
+	int ret;
+
+	if (!value)
+		return -EINVAL;
+
+	lower_addr = lower_32_bits((u64)&buf);
+	upper_addr = upper_32_bits((u64)&buf);
+
+	ret = zynqmp_pm_invoke_fn(PM_FPGA_READ,
+				  XILINX_ZYNQMP_PM_FPGA_CONFIG_STAT_OFFSET,
+				  lower_addr, upper_addr,
+				  XILINX_ZYNQMP_PM_FPGA_READ_CONFIG_REG,
+				  ret_payload);
+
+	*value = ret_payload[1];
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(zynqmp_pm_fpga_get_config_status);
 
 /**
  * zynqmp_pm_pinctrl_request - Request Pin from firmware
@@ -948,6 +1157,15 @@ EXPORT_SYMBOL_GPL(zynqmp_pm_pinctrl_get_config);
 int zynqmp_pm_pinctrl_set_config(const u32 pin, const u32 param,
 				 u32 value)
 {
+	int ret;
+
+	if (pm_family_code == ZYNQMP_FAMILY_CODE &&
+	    param == PM_PINCTRL_CONFIG_TRI_STATE) {
+		ret = zynqmp_pm_feature(PM_PINCTRL_CONFIG_PARAM_SET);
+		if (ret < PM_PINCTRL_PARAM_SET_VERSION)
+			return -EOPNOTSUPP;
+	}
+
 	return zynqmp_pm_invoke_fn(PM_PINCTRL_CONFIG_PARAM_SET, pin,
 				   param, value, 0, NULL);
 }
@@ -1058,6 +1276,103 @@ int zynqmp_pm_release_node(const u32 node)
 EXPORT_SYMBOL_GPL(zynqmp_pm_release_node);
 
 /**
+ * zynqmp_pm_get_rpu_mode() - Get RPU mode
+ * @node_id:	Node ID of the device
+ * @rpu_mode:	return by reference value
+ *		either split or lockstep
+ *
+ * Return:	return 0 on success or error+reason.
+ *		if success, then  rpu_mode will be set
+ *		to current rpu mode.
+ */
+int zynqmp_pm_get_rpu_mode(u32 node_id, enum rpu_oper_mode *rpu_mode)
+{
+	u32 ret_payload[PAYLOAD_ARG_CNT];
+	int ret;
+
+	ret = zynqmp_pm_invoke_fn(PM_IOCTL, node_id,
+				  IOCTL_GET_RPU_OPER_MODE, 0, 0, ret_payload);
+
+	/* only set rpu_mode if no error */
+	if (ret == XST_PM_SUCCESS)
+		*rpu_mode = ret_payload[0];
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(zynqmp_pm_get_rpu_mode);
+
+/**
+ * zynqmp_pm_set_rpu_mode() - Set RPU mode
+ * @node_id:	Node ID of the device
+ * @rpu_mode:	Argument 1 to requested IOCTL call. either split or lockstep
+ *
+ *		This function is used to set RPU mode to split or
+ *		lockstep
+ *
+ * Return:	Returns status, either success or error+reason
+ */
+int zynqmp_pm_set_rpu_mode(u32 node_id, enum rpu_oper_mode rpu_mode)
+{
+	return zynqmp_pm_invoke_fn(PM_IOCTL, node_id,
+				   IOCTL_SET_RPU_OPER_MODE, (u32)rpu_mode,
+				   0, NULL);
+}
+EXPORT_SYMBOL_GPL(zynqmp_pm_set_rpu_mode);
+
+/**
+ * zynqmp_pm_set_tcm_config - configure TCM
+ * @node_id:	Firmware specific TCM subsystem ID
+ * @tcm_mode:	Argument 1 to requested IOCTL call
+ *              either PM_RPU_TCM_COMB or PM_RPU_TCM_SPLIT
+ *
+ * This function is used to set RPU mode to split or combined
+ *
+ * Return: status: 0 for success, else failure
+ */
+int zynqmp_pm_set_tcm_config(u32 node_id, enum rpu_tcm_comb tcm_mode)
+{
+	return zynqmp_pm_invoke_fn(PM_IOCTL, node_id,
+				   IOCTL_TCM_COMB_CONFIG, (u32)tcm_mode, 0,
+				   NULL);
+}
+EXPORT_SYMBOL_GPL(zynqmp_pm_set_tcm_config);
+
+/**
+ * zynqmp_pm_force_pwrdwn - PM call to request for another PU or subsystem to
+ *             be powered down forcefully
+ * @node:  Node ID of the targeted PU or subsystem
+ * @ack:   Flag to specify whether acknowledge is requested
+ *
+ * Return: status, either success or error+reason
+ */
+int zynqmp_pm_force_pwrdwn(const u32 node,
+			   const enum zynqmp_pm_request_ack ack)
+{
+	return zynqmp_pm_invoke_fn(PM_FORCE_POWERDOWN, node, ack, 0, 0, NULL);
+}
+EXPORT_SYMBOL_GPL(zynqmp_pm_force_pwrdwn);
+
+/**
+ * zynqmp_pm_request_wake - PM call to wake up selected master or subsystem
+ * @node:  Node ID of the master or subsystem
+ * @set_addr:  Specifies whether the address argument is relevant
+ * @address:   Address from which to resume when woken up
+ * @ack:   Flag to specify whether acknowledge requested
+ *
+ * Return: status, either success or error+reason
+ */
+int zynqmp_pm_request_wake(const u32 node,
+			   const bool set_addr,
+			   const u64 address,
+			   const enum zynqmp_pm_request_ack ack)
+{
+	/* set_addr flag is encoded into 1st bit of address */
+	return zynqmp_pm_invoke_fn(PM_REQUEST_WAKEUP, node, address | set_addr,
+				   address >> 32, ack, NULL);
+}
+EXPORT_SYMBOL_GPL(zynqmp_pm_request_wake);
+
+/**
  * zynqmp_pm_set_requirement() - PM call to set requirement for PM slaves
  * @node:		Node ID of the slave
  * @capabilities:	Requested capabilities of the slave
@@ -1121,6 +1436,32 @@ int zynqmp_pm_aes_engine(const u64 address, u32 *out)
 EXPORT_SYMBOL_GPL(zynqmp_pm_aes_engine);
 
 /**
+ * zynqmp_pm_sha_hash - Access the SHA engine to calculate the hash
+ * @address:	Address of the data/ Address of output buffer where
+ *		hash should be stored.
+ * @size:	Size of the data.
+ * @flags:
+ *	BIT(0) - for initializing csudma driver and SHA3(Here address
+ *		 and size inputs can be NULL).
+ *	BIT(1) - to call Sha3_Update API which can be called multiple
+ *		 times when data is not contiguous.
+ *	BIT(2) - to get final hash of the whole updated data.
+ *		 Hash will be overwritten at provided address with
+ *		 48 bytes.
+ *
+ * Return:	Returns status, either success or error code.
+ */
+int zynqmp_pm_sha_hash(const u64 address, const u32 size, const u32 flags)
+{
+	u32 lower_addr = lower_32_bits(address);
+	u32 upper_addr = upper_32_bits(address);
+
+	return zynqmp_pm_invoke_fn(PM_SECURE_SHA, upper_addr, lower_addr,
+				   size, flags, NULL);
+}
+EXPORT_SYMBOL_GPL(zynqmp_pm_sha_hash);
+
+/**
  * zynqmp_pm_register_notifier() - PM API for register a subsystem
  *                                to be notified about specific
  *                                event/error.
@@ -1155,6 +1496,64 @@ int zynqmp_pm_system_shutdown(const u32 type, const u32 subtype)
 	return zynqmp_pm_invoke_fn(PM_SYSTEM_SHUTDOWN, type, subtype,
 				   0, 0, NULL);
 }
+
+/**
+ * zynqmp_pm_set_feature_config - PM call to request IOCTL for feature config
+ * @id:         The config ID of the feature to be configured
+ * @value:      The config value of the feature to be configured
+ *
+ * Return:      Returns 0 on success or error value on failure.
+ */
+int zynqmp_pm_set_feature_config(enum pm_feature_config_id id, u32 value)
+{
+	return zynqmp_pm_invoke_fn(PM_IOCTL, 0, IOCTL_SET_FEATURE_CONFIG,
+				   id, value, NULL);
+}
+
+/**
+ * zynqmp_pm_get_feature_config - PM call to get value of configured feature
+ * @id:         The config id of the feature to be queried
+ * @payload:    Returned value array
+ *
+ * Return:      Returns 0 on success or error value on failure.
+ */
+int zynqmp_pm_get_feature_config(enum pm_feature_config_id id,
+				 u32 *payload)
+{
+	return zynqmp_pm_invoke_fn(PM_IOCTL, 0, IOCTL_GET_FEATURE_CONFIG,
+				   id, 0, payload);
+}
+
+/**
+ * zynqmp_pm_set_sd_config - PM call to set value of SD config registers
+ * @node:	SD node ID
+ * @config:	The config type of SD registers
+ * @value:	Value to be set
+ *
+ * Return:	Returns 0 on success or error value on failure.
+ */
+int zynqmp_pm_set_sd_config(u32 node, enum pm_sd_config_type config, u32 value)
+{
+	return zynqmp_pm_invoke_fn(PM_IOCTL, node, IOCTL_SET_SD_CONFIG,
+				   config, value, NULL);
+}
+EXPORT_SYMBOL_GPL(zynqmp_pm_set_sd_config);
+
+/**
+ * zynqmp_pm_set_gem_config - PM call to set value of GEM config registers
+ * @node:	GEM node ID
+ * @config:	The config type of GEM registers
+ * @value:	Value to be set
+ *
+ * Return:	Returns 0 on success or error value on failure.
+ */
+int zynqmp_pm_set_gem_config(u32 node, enum pm_gem_config_type config,
+			     u32 value)
+{
+	return zynqmp_pm_invoke_fn(PM_IOCTL, node, IOCTL_SET_GEM_CONFIG,
+				   config, value, NULL);
+}
+EXPORT_SYMBOL_GPL(zynqmp_pm_set_gem_config);
 
 /**
  * struct zynqmp_pm_shutdown_scope - Struct for shutdown scope
@@ -1424,6 +1823,78 @@ static DEVICE_ATTR_RW(pggs1);
 static DEVICE_ATTR_RW(pggs2);
 static DEVICE_ATTR_RW(pggs3);
 
+static ssize_t feature_config_id_show(struct device *device,
+				      struct device_attribute *attr,
+				      char *buf)
+{
+	struct zynqmp_devinfo *devinfo = dev_get_drvdata(device);
+
+	return sysfs_emit(buf, "%d\n", devinfo->feature_conf_id);
+}
+
+static ssize_t feature_config_id_store(struct device *device,
+				       struct device_attribute *attr,
+				       const char *buf, size_t count)
+{
+	u32 config_id;
+	int ret;
+	struct zynqmp_devinfo *devinfo = dev_get_drvdata(device);
+
+	if (!buf)
+		return -EINVAL;
+
+	ret = kstrtou32(buf, 10, &config_id);
+	if (ret)
+		return ret;
+
+	devinfo->feature_conf_id = config_id;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(feature_config_id);
+
+static ssize_t feature_config_value_show(struct device *device,
+					 struct device_attribute *attr,
+					 char *buf)
+{
+	int ret;
+	u32 ret_payload[PAYLOAD_ARG_CNT];
+	struct zynqmp_devinfo *devinfo = dev_get_drvdata(device);
+
+	ret = zynqmp_pm_get_feature_config(devinfo->feature_conf_id,
+					   ret_payload);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%d\n", ret_payload[1]);
+}
+
+static ssize_t feature_config_value_store(struct device *device,
+					  struct device_attribute *attr,
+					  const char *buf, size_t count)
+{
+	u32 value;
+	int ret;
+	struct zynqmp_devinfo *devinfo = dev_get_drvdata(device);
+
+	if (!buf)
+		return -EINVAL;
+
+	ret = kstrtou32(buf, 10, &value);
+	if (ret)
+		return ret;
+
+	ret = zynqmp_pm_set_feature_config(devinfo->feature_conf_id,
+					   value);
+	if (ret)
+		return ret;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(feature_config_value);
+
 static struct attribute *zynqmp_firmware_attrs[] = {
 	&dev_attr_ggs0.attr,
 	&dev_attr_ggs1.attr,
@@ -1435,6 +1906,8 @@ static struct attribute *zynqmp_firmware_attrs[] = {
 	&dev_attr_pggs3.attr,
 	&dev_attr_shutdown_scope.attr,
 	&dev_attr_health_status.attr,
+	&dev_attr_feature_config_id.attr,
+	&dev_attr_feature_config_value.attr,
 	NULL,
 };
 
@@ -1444,7 +1917,12 @@ static int zynqmp_firmware_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct device_node *np;
+	struct zynqmp_devinfo *devinfo;
 	int ret;
+
+	ret = get_set_conduit_method(dev->of_node);
+	if (ret)
+		return ret;
 
 	np = of_find_compatible_node(NULL, NULL, "xlnx,zynqmp");
 	if (!np) {
@@ -1454,11 +1932,22 @@ static int zynqmp_firmware_probe(struct platform_device *pdev)
 
 		feature_check_enabled = true;
 	}
+
+	if (!feature_check_enabled) {
+		ret = do_feature_check_call(PM_FEATURE_CHECK);
+		if (ret >= 0)
+			feature_check_enabled = true;
+	}
+
 	of_node_put(np);
 
-	ret = get_set_conduit_method(dev->of_node);
-	if (ret)
-		return ret;
+	devinfo = devm_kzalloc(dev, sizeof(*devinfo), GFP_KERNEL);
+	if (!devinfo)
+		return -ENOMEM;
+
+	devinfo->dev = dev;
+
+	platform_set_drvdata(pdev, devinfo);
 
 	/* Check PM API version number */
 	ret = zynqmp_pm_get_api_version(&pm_api_version);
@@ -1474,6 +1963,11 @@ static int zynqmp_firmware_probe(struct platform_device *pdev)
 
 	pr_info("%s Platform Management API v%d.%d\n", __func__,
 		pm_api_version >> 16, pm_api_version & 0xFFFF);
+
+	/* Get the Family code and sub family code of platform */
+	ret = zynqmp_pm_get_family_info(&pm_family_code, &pm_sub_family_code);
+	if (ret < 0)
+		return ret;
 
 	/* Check trustzone version number */
 	ret = zynqmp_pm_get_trustzone_version(&pm_tz_version);

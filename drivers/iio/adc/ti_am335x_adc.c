@@ -14,7 +14,6 @@
 #include <linux/io.h>
 #include <linux/iio/iio.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
 #include <linux/iio/machine.h>
 #include <linux/iio/driver.h>
 #include <linux/iopoll.h>
@@ -376,9 +375,7 @@ static int tiadc_iio_buffered_hardware_setup(struct device *dev,
 {
 	int ret;
 
-	ret = devm_iio_kfifo_buffer_setup(dev, indio_dev,
-					  INDIO_BUFFER_SOFTWARE,
-					  setup_ops);
+	ret = devm_iio_kfifo_buffer_setup(dev, indio_dev, setup_ops);
 	if (ret)
 		return ret;
 
@@ -704,7 +701,7 @@ static int tiadc_remove(struct platform_device *pdev)
 	return 0;
 }
 
-static int __maybe_unused tiadc_suspend(struct device *dev)
+static int tiadc_suspend(struct device *dev)
 {
 	struct iio_dev *indio_dev = dev_get_drvdata(dev);
 	struct tiadc_device *adc_dev = iio_priv(indio_dev);
@@ -717,7 +714,7 @@ static int __maybe_unused tiadc_suspend(struct device *dev)
 	return 0;
 }
 
-static int __maybe_unused tiadc_resume(struct device *dev)
+static int tiadc_resume(struct device *dev)
 {
 	struct iio_dev *indio_dev = dev_get_drvdata(dev);
 	struct tiadc_device *adc_dev = iio_priv(indio_dev);
@@ -734,7 +731,7 @@ static int __maybe_unused tiadc_resume(struct device *dev)
 	return 0;
 }
 
-static SIMPLE_DEV_PM_OPS(tiadc_pm_ops, tiadc_suspend, tiadc_resume);
+static DEFINE_SIMPLE_DEV_PM_OPS(tiadc_pm_ops, tiadc_suspend, tiadc_resume);
 
 static const struct of_device_id ti_adc_dt_ids[] = {
 	{ .compatible = "ti,am3359-adc", },
@@ -746,7 +743,7 @@ MODULE_DEVICE_TABLE(of, ti_adc_dt_ids);
 static struct platform_driver tiadc_driver = {
 	.driver = {
 		.name   = "TI-am335x-adc",
-		.pm	= &tiadc_pm_ops,
+		.pm	= pm_sleep_ptr(&tiadc_pm_ops),
 		.of_match_table = ti_adc_dt_ids,
 	},
 	.probe	= tiadc_probe,

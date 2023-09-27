@@ -11,8 +11,9 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/of_dma.h>
-#include <linux/of_platform.h>
+#include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/clk.h>
 #include <linux/io-64-nonatomic-lo-hi.h>
@@ -229,7 +230,7 @@ struct zynqmp_dma_chan {
 	bool is_dmacoherent;
 	struct tasklet_struct tasklet;
 	bool idle;
-	u32 desc_size;
+	size_t desc_size;
 	bool err;
 	u32 bus_width;
 	u32 src_burst_len;
@@ -486,7 +487,8 @@ static int zynqmp_dma_alloc_chan_resources(struct dma_chan *dchan)
 	}
 
 	chan->desc_pool_v = dma_alloc_coherent(chan->dev,
-					       (2 * chan->desc_size * ZYNQMP_DMA_NUM_DESCS),
+					       (2 * ZYNQMP_DMA_DESC_SIZE(chan) *
+					       ZYNQMP_DMA_NUM_DESCS),
 					       &chan->desc_pool_p, GFP_KERNEL);
 	if (!chan->desc_pool_v)
 		return -ENOMEM;
@@ -795,6 +797,17 @@ static int zynqmp_dma_device_terminate_all(struct dma_chan *dchan)
 }
 
 /**
+ * zynqmp_dma_synchronize - Synchronizes the termination of a transfers to the current context.
+ * @dchan: DMA channel pointer
+ */
+static void zynqmp_dma_synchronize(struct dma_chan *dchan)
+{
+	struct zynqmp_dma_chan *chan = to_chan(dchan);
+
+	tasklet_kill(&chan->tasklet);
+}
+
+/**
  * zynqmp_dma_prep_memcpy - prepare descriptors for memcpy transaction
  * @dchan: DMA channel
  * @dma_dst: Destination buffer address
@@ -848,7 +861,7 @@ static struct dma_async_tx_descriptor *zynqmp_dma_prep_memcpy(
 
 	zynqmp_dma_desc_config_eod(chan, desc);
 	async_tx_ack(&first->async_tx);
-	first->async_tx.flags = flags;
+	first->async_tx.flags = (enum dma_ctrl_flags)flags;
 	return &first->async_tx;
 }
 
@@ -878,7 +891,6 @@ static int zynqmp_dma_chan_probe(struct zynqmp_dma_device *zdev,
 			   struct platform_device *pdev)
 {
 	struct zynqmp_dma_chan *chan;
-	struct resource *res;
 	struct device_node *node = pdev->dev.of_node;
 	int err;
 
@@ -888,8 +900,7 @@ static int zynqmp_dma_chan_probe(struct zynqmp_dma_device *zdev,
 	chan->dev = zdev->dev;
 	chan->zdev = zdev;
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	chan->regs = devm_ioremap_resource(&pdev->dev, res);
+	chan->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(chan->regs))
 		return PTR_ERR(chan->regs);
 
@@ -1050,12 +1061,17 @@ static int zynqmp_dma_probe(struct platform_device *pdev)
 	zdev->dev = &pdev->dev;
 	INIT_LIST_HEAD(&zdev->common.channels);
 
-	dma_set_mask(&pdev->dev, DMA_BIT_MASK(44));
+	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(44));
+	if (ret) {
+		dev_err(&pdev->dev, "DMA not available for address range\n");
+		return ret;
+	}
 	dma_cap_set(DMA_MEMCPY, zdev->common.cap_mask);
 
 	p = &zdev->common;
 	p->device_prep_dma_memcpy = zynqmp_dma_prep_memcpy;
 	p->device_terminate_all = zynqmp_dma_device_terminate_all;
+	p->device_synchronize = zynqmp_dma_synchronize;
 	p->device_issue_pending = zynqmp_dma_issue_pending;
 	p->device_alloc_chan_resources = zynqmp_dma_alloc_chan_resources;
 	p->device_free_chan_resources = zynqmp_dma_free_chan_resources;
@@ -1077,7 +1093,11 @@ static int zynqmp_dma_probe(struct platform_device *pdev)
 	pm_runtime_set_autosuspend_delay(zdev->dev, ZDMA_PM_TIMEOUT);
 	pm_runtime_use_autosuspend(zdev->dev);
 	pm_runtime_enable(zdev->dev);
-	pm_runtime_get_sync(zdev->dev);
+	ret = pm_runtime_resume_and_get(zdev->dev);
+	if (ret < 0) {
+		dev_err(&pdev->dev, "device wakeup failed.\n");
+		pm_runtime_disable(zdev->dev);
+	}
 	if (!pm_runtime_enabled(zdev->dev)) {
 		ret = zynqmp_dma_runtime_resume(zdev->dev);
 		if (ret)
@@ -1093,7 +1113,11 @@ static int zynqmp_dma_probe(struct platform_device *pdev)
 	p->dst_addr_widths = BIT(zdev->chan->bus_width / 8);
 	p->src_addr_widths = BIT(zdev->chan->bus_width / 8);
 
-	dma_async_device_register(&zdev->common);
+	ret = dma_async_device_register(&zdev->common);
+	if (ret) {
+		dev_err(zdev->dev, "failed to register the dma device\n");
+		goto free_chan_resources;
+	}
 
 	ret = of_dma_controller_register(pdev->dev.of_node,
 					 of_zynqmp_dma_xlate, zdev);

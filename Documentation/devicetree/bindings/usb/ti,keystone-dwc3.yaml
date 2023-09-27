@@ -34,14 +34,6 @@ properties:
     minItems: 1
     maxItems: 2
 
-  assigned-clocks:
-    minItems: 1
-    maxItems: 2
-
-  assigned-clock-parents:
-    minItems: 1
-    maxItems: 2
-
   power-domains:
     maxItems: 1
     description: Should contain a phandle to a PM domain provider node
@@ -92,7 +84,7 @@ examples:
       ranges;
 
       usb@2690000 {
-        compatible = "synopsys,dwc3";
+        compatible = "snps,dwc3";
         reg = <0x2690000 0x70000>;
         interrupts = <GIC_SPI 393 IRQ_TYPE_EDGE_RISING>;
         usb-phy = <&usb_phy>, <&usb_phy>;

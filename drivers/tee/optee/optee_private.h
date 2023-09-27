@@ -59,6 +59,16 @@ struct optee_notif {
 	u_long *bitmap;
 };
 
+#define OPTEE_SHM_ARG_ALLOC_PRIV	BIT(0)
+#define OPTEE_SHM_ARG_SHARED		BIT(1)
+struct optee_shm_arg_entry;
+struct optee_shm_arg_cache {
+	u32 flags;
+	/* Serializes access to this struct */
+	struct mutex mutex;
+	struct list_head shm_args;
+};
+
 /**
  * struct optee_supp - supplicant synchronization struct
  * @ctx			the context of current connected supplicant.
@@ -84,11 +94,35 @@ struct optee_supp {
 	struct completion reqs_c;
 };
 
+/*
+ * struct optee_pcpu - per cpu notif private struct passed to work functions
+ * @optee		optee device reference
+ */
+struct optee_pcpu {
+	struct optee *optee;
+};
+
+/*
+ * struct optee_smc - optee smc communication struct
+ * @invoke_fn		handler function to invoke secure monitor
+ * @memremaped_shm	virtual address of memory in shared memory pool
+ * @sec_caps:		secure world capabilities defined by
+ *			OPTEE_SMC_SEC_CAP_* in optee_smc.h
+ * @notif_irq		interrupt used as async notification by OP-TEE or 0
+ * @optee_pcpu		per_cpu optee instance for per cpu work or NULL
+ * @notif_pcpu_wq	workqueue for per cpu asynchronous notification or NULL
+ * @notif_pcpu_work	work for per cpu asynchronous notification
+ * @notif_cpuhp_state   CPU hotplug state assigned for pcpu interrupt management
+ */
 struct optee_smc {
 	optee_invoke_fn *invoke_fn;
 	void *memremaped_shm;
 	u32 sec_caps;
 	unsigned int notif_irq;
+	struct optee_pcpu __percpu *optee_pcpu;
+	struct workqueue_struct *notif_pcpu_wq;
+	struct work_struct notif_pcpu_work;
+	unsigned int notif_cpuhp_state;
 };
 
 /**
@@ -101,7 +135,6 @@ struct optee_smc {
  */
 struct optee_ffa {
 	struct ffa_device *ffa_dev;
-	const struct ffa_dev_ops *ffa_ops;
 	/* Serializes access to @global_ids */
 	struct mutex mutex;
 	struct rhashtable global_ids;
@@ -121,7 +154,7 @@ struct optee;
  */
 struct optee_ops {
 	int (*do_call_with_arg)(struct tee_context *ctx,
-				struct tee_shm *shm_arg);
+				struct tee_shm *shm_arg, u_int offs);
 	int (*to_msg_param)(struct optee *optee,
 			    struct optee_msg_param *msg_params,
 			    size_t num_params, const struct tee_param *params);
@@ -143,7 +176,7 @@ struct optee_ops {
  * @notif:		notification synchronization struct
  * @supp:		supplicant synchronization struct for RPC to supplicant
  * @pool:		shared memory pool
- * @rpc_arg_count:	If > 0 number of RPC parameters to make room for
+ * @rpc_param_count:	If > 0 number of RPC parameters to make room for
  * @scan_bus_done	flag if device registation was already done.
  * @scan_bus_wq		workqueue to scan optee bus and register optee drivers
  * @scan_bus_work	workq to scan optee bus and register optee drivers
@@ -157,11 +190,12 @@ struct optee {
 		struct optee_smc smc;
 		struct optee_ffa ffa;
 	};
+	struct optee_shm_arg_cache shm_arg_cache;
 	struct optee_call_queue call_queue;
 	struct optee_notif notif;
 	struct optee_supp supp;
 	struct tee_shm_pool *pool;
-	unsigned int rpc_arg_count;
+	unsigned int rpc_param_count;
 	bool   scan_bus_done;
 	struct workqueue_struct *scan_bus_wq;
 	struct work_struct scan_bus_work;
@@ -229,13 +263,16 @@ int optee_cancel_req(struct tee_context *ctx, u32 cancel_id, u32 session);
 int optee_enumerate_devices(u32 func);
 void optee_unregister_devices(void);
 
-int optee_pool_op_alloc_helper(struct tee_shm_pool_mgr *poolm,
-			       struct tee_shm *shm, size_t size,
+int optee_pool_op_alloc_helper(struct tee_shm_pool *pool, struct tee_shm *shm,
+			       size_t size, size_t align,
 			       int (*shm_register)(struct tee_context *ctx,
 						   struct tee_shm *shm,
 						   struct page **pages,
 						   size_t num_pages,
 						   unsigned long start));
+void optee_pool_op_free_helper(struct tee_shm_pool *pool, struct tee_shm *shm,
+			       int (*shm_unregister)(struct tee_context *ctx,
+						     struct tee_shm *shm));
 
 
 void optee_remove_common(struct optee *optee);
@@ -270,8 +307,18 @@ void optee_cq_wait_for_completion(struct optee_call_queue *cq,
 void optee_cq_wait_final(struct optee_call_queue *cq,
 			 struct optee_call_waiter *w);
 int optee_check_mem_type(unsigned long start, size_t num_pages);
-struct tee_shm *optee_get_msg_arg(struct tee_context *ctx, size_t num_params,
-				  struct optee_msg_arg **msg_arg);
+
+void optee_shm_arg_cache_init(struct optee *optee, u32 flags);
+void optee_shm_arg_cache_uninit(struct optee *optee);
+struct optee_msg_arg *optee_get_msg_arg(struct tee_context *ctx,
+					size_t num_params,
+					struct optee_shm_arg_entry **entry,
+					struct tee_shm **shm_ret,
+					u_int *offs);
+void optee_free_msg_arg(struct tee_context *ctx,
+			struct optee_shm_arg_entry *entry, u_int offs);
+size_t optee_msg_arg_size(size_t rpc_param_count);
+
 
 struct tee_shm *optee_rpc_cmd_alloc_suppl(struct tee_context *ctx, size_t sz);
 void optee_rpc_cmd_free_suppl(struct tee_context *ctx, struct tee_shm *shm);

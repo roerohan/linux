@@ -12,9 +12,8 @@
 #include <asm/vmlinux.lds.h>
 #include <asm/cache.h>
 #include <asm/thread_info.h>
-#include <asm/memory.h>
-#include <asm/mpu.h>
 #include <asm/page.h>
+#include <asm/mpu.h>
 
 OUTPUT_ARCH(arm)
 ENTRY(stext)
@@ -138,12 +137,12 @@ SECTIONS
 #ifdef CONFIG_STRICT_KERNEL_RWX
 	. = ALIGN(1<<SECTION_SHIFT);
 #else
-	. = ALIGN(THREAD_SIZE);
+	. = ALIGN(THREAD_ALIGN);
 #endif
 	__init_end = .;
 
 	_sdata = .;
-	RW_DATA(L1_CACHE_BYTES, PAGE_SIZE, THREAD_SIZE)
+	RW_DATA(L1_CACHE_BYTES, PAGE_SIZE, THREAD_ALIGN)
 	_edata = .;
 
 	BSS_SECTION(0, 0, 0)

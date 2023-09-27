@@ -29,6 +29,8 @@
 #include <linux/netfilter/nfnetlink_queue.h>
 #include <linux/netfilter/nf_conntrack_common.h>
 #include <linux/list.h>
+#include <linux/cgroup-defs.h>
+#include <net/gso.h>
 #include <net/sock.h>
 #include <net/tcp_states.h>
 #include <net/netfilter/nf_queue.h>
@@ -301,6 +303,19 @@ nla_put_failure:
 	return -1;
 }
 
+static int nfqnl_put_sk_classid(struct sk_buff *skb, struct sock *sk)
+{
+#if IS_ENABLED(CONFIG_CGROUP_NET_CLASSID)
+	if (sk && sk_fullsock(sk)) {
+		u32 classid = sock_cgroup_classid(&sk->sk_cgrp_data);
+
+		if (classid && nla_put_be32(skb, NFQA_CGROUP_CLASSID, htonl(classid)))
+			return -1;
+	}
+#endif
+	return 0;
+}
+
 static u32 nfqnl_get_sk_secctx(struct sk_buff *skb, char **secdata)
 {
 	u32 seclen = 0;
@@ -392,6 +407,7 @@ nfqnl_build_packet_message(struct net *net, struct nfqnl_instance *queue,
 	bool csum_verify;
 	char *secdata = NULL;
 	u32 seclen = 0;
+	ktime_t tstamp;
 
 	size = nlmsg_total_size(sizeof(struct nfgenmsg))
 		+ nla_total_size(sizeof(struct nfqnl_msg_packet_hdr))
@@ -402,11 +418,16 @@ nfqnl_build_packet_message(struct net *net, struct nfqnl_instance *queue,
 		+ nla_total_size(sizeof(u_int32_t))	/* ifindex */
 #endif
 		+ nla_total_size(sizeof(u_int32_t))	/* mark */
+		+ nla_total_size(sizeof(u_int32_t))	/* priority */
 		+ nla_total_size(sizeof(struct nfqnl_msg_packet_hw))
 		+ nla_total_size(sizeof(u_int32_t))	/* skbinfo */
+#if IS_ENABLED(CONFIG_CGROUP_NET_CLASSID)
+		+ nla_total_size(sizeof(u_int32_t))	/* classid */
+#endif
 		+ nla_total_size(sizeof(u_int32_t));	/* cap_len */
 
-	if (entskb->tstamp)
+	tstamp = skb_tstamp_cond(entskb, false);
+	if (tstamp)
 		size += nla_total_size(sizeof(struct nfqnl_msg_packet_timestamp));
 
 	size += nfqnl_get_bridge_size(entry);
@@ -559,6 +580,10 @@ nfqnl_build_packet_message(struct net *net, struct nfqnl_instance *queue,
 	    nla_put_be32(skb, NFQA_MARK, htonl(entskb->mark)))
 		goto nla_put_failure;
 
+	if (entskb->priority &&
+	    nla_put_be32(skb, NFQA_PRIORITY, htonl(entskb->priority)))
+		goto nla_put_failure;
+
 	if (indev && entskb->dev &&
 	    skb_mac_header_was_set(entskb) &&
 	    skb_mac_header_len(entskb) != 0) {
@@ -577,9 +602,9 @@ nfqnl_build_packet_message(struct net *net, struct nfqnl_instance *queue,
 	if (nfqnl_put_bridge(entry, skb) < 0)
 		goto nla_put_failure;
 
-	if (entry->state.hook <= NF_INET_FORWARD && entskb->tstamp) {
+	if (entry->state.hook <= NF_INET_FORWARD && tstamp) {
 		struct nfqnl_msg_packet_timestamp ts;
-		struct timespec64 kts = ktime_to_timespec64(entskb->tstamp);
+		struct timespec64 kts = ktime_to_timespec64(tstamp);
 
 		ts.sec = cpu_to_be64(kts.tv_sec);
 		ts.usec = cpu_to_be64(kts.tv_nsec / NSEC_PER_USEC);
@@ -590,6 +615,9 @@ nfqnl_build_packet_message(struct net *net, struct nfqnl_instance *queue,
 
 	if ((queue->flags & NFQA_CFG_F_UID_GID) && entskb->sk &&
 	    nfqnl_put_sk_uidgid(skb, entskb->sk) < 0)
+		goto nla_put_failure;
+
+	if (nfqnl_put_sk_classid(skb, entskb->sk) < 0)
 		goto nla_put_failure;
 
 	if (seclen && nla_put(skb, NFQA_SECCTX, seclen, secdata))
@@ -710,9 +738,15 @@ static struct nf_queue_entry *
 nf_queue_entry_dup(struct nf_queue_entry *e)
 {
 	struct nf_queue_entry *entry = kmemdup(e, e->size, GFP_ATOMIC);
-	if (entry)
-		nf_queue_entry_get_refs(entry);
-	return entry;
+
+	if (!entry)
+		return NULL;
+
+	if (nf_queue_entry_get_refs(entry))
+		return entry;
+
+	kfree(entry);
+	return NULL;
 }
 
 #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
@@ -830,11 +864,16 @@ nfqnl_enqueue_packet(struct nf_queue_entry *entry, unsigned int queuenum)
 }
 
 static int
-nfqnl_mangle(void *data, int data_len, struct nf_queue_entry *e, int diff)
+nfqnl_mangle(void *data, unsigned int data_len, struct nf_queue_entry *e, int diff)
 {
 	struct sk_buff *nskb;
 
 	if (diff < 0) {
+		unsigned int min_len = skb_transport_offset(e->skb);
+
+		if (data_len < min_len)
+			return -EINVAL;
+
 		if (pskb_trim(e->skb, data_len))
 			return -ENOMEM;
 	} else if (diff > 0) {
@@ -1014,11 +1053,13 @@ static const struct nla_policy nfqa_verdict_policy[NFQA_MAX+1] = {
 	[NFQA_CT]		= { .type = NLA_UNSPEC },
 	[NFQA_EXP]		= { .type = NLA_UNSPEC },
 	[NFQA_VLAN]		= { .type = NLA_NESTED },
+	[NFQA_PRIORITY]		= { .type = NLA_U32 },
 };
 
 static const struct nla_policy nfqa_verdict_batch_policy[NFQA_MAX+1] = {
 	[NFQA_VERDICT_HDR]	= { .len = sizeof(struct nfqnl_msg_verdict_hdr) },
 	[NFQA_MARK]		= { .type = NLA_U32 },
+	[NFQA_PRIORITY]		= { .type = NLA_U32 },
 };
 
 static struct nfqnl_instance *
@@ -1098,6 +1139,9 @@ static int nfqnl_recv_verdict_batch(struct sk_buff *skb,
 	list_for_each_entry_safe(entry, tmp, &batch_list, list) {
 		if (nfqa[NFQA_MARK])
 			entry->skb->mark = ntohl(nla_get_be32(nfqa[NFQA_MARK]));
+
+		if (nfqa[NFQA_PRIORITY])
+			entry->skb->priority = ntohl(nla_get_be32(nfqa[NFQA_PRIORITY]));
 
 		nfqnl_reinject(entry, verdict);
 	}
@@ -1224,6 +1268,9 @@ static int nfqnl_recv_verdict(struct sk_buff *skb, const struct nfnl_info *info,
 
 	if (nfqa[NFQA_MARK])
 		entry->skb->mark = ntohl(nla_get_be32(nfqa[NFQA_MARK]));
+
+	if (nfqa[NFQA_PRIORITY])
+		entry->skb->priority = ntohl(nla_get_be32(nfqa[NFQA_PRIORITY]));
 
 	nfqnl_reinject(entry, verdict);
 	return 0;

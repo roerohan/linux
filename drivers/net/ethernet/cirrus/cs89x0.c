@@ -54,7 +54,6 @@
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/kernel.h>
 #include <linux/types.h>
@@ -71,6 +70,8 @@
 #include <linux/delay.h>
 #include <linux/gfp.h>
 #include <linux/io.h>
+
+#include <net/Space.h>
 
 #include <asm/irq.h>
 #include <linux/atomic.h>
@@ -985,7 +986,7 @@ release_irq:
 		if (result == DETECTED_NONE) {
 			pr_warn("%s: 10Base-5 (AUI) has no cable\n", dev->name);
 			if (lp->auto_neg_cnf & IMM_BIT) /* check "ignore missing media" bit */
-				result = DETECTED_AUI; /* Yes! I don't care if I see a carrrier */
+				result = DETECTED_AUI; /* Yes! I don't care if I see a carrier */
 		}
 		break;
 	case A_CNF_MEDIA_10B_2:
@@ -1853,9 +1854,8 @@ static int __init cs89x0_platform_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	dev->irq = platform_get_irq(pdev, 0);
-	if (dev->irq <= 0) {
-		dev_warn(&dev->dev, "interrupt resource missing\n");
-		err = -ENXIO;
+	if (dev->irq < 0) {
+		err = dev->irq;
 		goto free;
 	}
 

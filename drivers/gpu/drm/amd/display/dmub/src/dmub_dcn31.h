@@ -151,7 +151,8 @@ struct dmub_srv;
 	DMUB_SF(DCN_VM_FB_OFFSET, FB_OFFSET) \
 	DMUB_SF(DMCUB_INBOX0_WPTR, DMCUB_INBOX0_WPTR) \
 	DMUB_SF(DMCUB_INTERRUPT_ENABLE, DMCUB_GPINT_IH_INT_EN) \
-	DMUB_SF(DMCUB_INTERRUPT_ACK, DMCUB_GPINT_IH_INT_ACK)
+	DMUB_SF(DMCUB_INTERRUPT_ACK, DMCUB_GPINT_IH_INT_ACK) \
+	DMUB_SF(DMCUB_CNTL, DMCUB_PWAIT_MODE_STATUS)
 
 struct dmub_srv_dcn31_reg_offset {
 #define DMUB_SR(reg) uint32_t reg;
@@ -203,6 +204,8 @@ void dmub_dcn31_setup_windows(struct dmub_srv *dmub,
 void dmub_dcn31_setup_mailbox(struct dmub_srv *dmub,
 			      const struct dmub_region *inbox1);
 
+uint32_t dmub_dcn31_get_inbox1_wptr(struct dmub_srv *dmub);
+
 uint32_t dmub_dcn31_get_inbox1_rptr(struct dmub_srv *dmub);
 
 void dmub_dcn31_set_inbox1_wptr(struct dmub_srv *dmub, uint32_t wptr_offset);
@@ -217,6 +220,8 @@ void dmub_dcn31_set_outbox1_rptr(struct dmub_srv *dmub, uint32_t rptr_offset);
 bool dmub_dcn31_is_hw_init(struct dmub_srv *dmub);
 
 bool dmub_dcn31_is_supported(struct dmub_srv *dmub);
+
+bool dmub_dcn31_is_psrsu_supported(struct dmub_srv *dmub);
 
 void dmub_dcn31_set_gpint(struct dmub_srv *dmub,
 			  union dmub_gpint_data_register reg);
@@ -233,6 +238,8 @@ void dmub_dcn31_enable_dmub_boot_options(struct dmub_srv *dmub, const struct dmu
 void dmub_dcn31_skip_dmub_panel_power_sequence(struct dmub_srv *dmub, bool skip);
 
 union dmub_fw_boot_status dmub_dcn31_get_fw_boot_status(struct dmub_srv *dmub);
+
+union dmub_fw_boot_options dmub_dcn31_get_fw_boot_option(struct dmub_srv *dmub);
 
 void dmub_dcn31_setup_outbox0(struct dmub_srv *dmub,
 			      const struct dmub_region *outbox0);

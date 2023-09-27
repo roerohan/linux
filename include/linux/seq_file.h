@@ -162,6 +162,7 @@ int seq_dentry(struct seq_file *, struct dentry *, const char *);
 int seq_path_root(struct seq_file *m, const struct path *path,
 		  const struct path *root, const char *esc);
 
+void *single_start(struct seq_file *, loff_t *);
 int single_open(struct file *, int (*)(struct seq_file *, void *), void *);
 int single_open_size(struct file *, int (*)(struct seq_file *, void *), void *, size_t);
 int single_release(struct inode *, struct file *);
@@ -248,18 +249,19 @@ static inline void seq_show_option(struct seq_file *m, const char *name,
 
 /**
  * seq_show_option_n - display mount options with appropriate escapes
- *		       where @value must be a specific length.
+ *		       where @value must be a specific length (i.e.
+ *		       not NUL-terminated).
  * @m: the seq_file handle
  * @name: the mount option name
  * @value: the mount option name's value, cannot be NULL
- * @length: the length of @value to display
+ * @length: the exact length of @value to display, must be constant expression
  *
  * This is a macro since this uses "length" to define the size of the
  * stack buffer.
  */
 #define seq_show_option_n(m, name, value, length) {	\
 	char val_buf[length + 1];			\
-	strncpy(val_buf, value, length);		\
+	memcpy(val_buf, value, length);			\
 	val_buf[length] = '\0';				\
 	seq_show_option(m, name, val_buf);		\
 }
@@ -275,6 +277,10 @@ extern struct list_head *seq_list_start_head(struct list_head *head,
 		loff_t pos);
 extern struct list_head *seq_list_next(void *v, struct list_head *head,
 		loff_t *ppos);
+
+extern struct list_head *seq_list_start_rcu(struct list_head *head, loff_t pos);
+extern struct list_head *seq_list_start_head_rcu(struct list_head *head, loff_t pos);
+extern struct list_head *seq_list_next_rcu(void *v, struct list_head *head, loff_t *ppos);
 
 /*
  * Helpers for iteration over hlist_head-s in seq_files

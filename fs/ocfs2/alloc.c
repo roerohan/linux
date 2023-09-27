@@ -5981,7 +5981,7 @@ bail:
 	return status;
 }
 
-/* Expects you to already be holding tl_inode->i_mutex */
+/* Expects you to already be holding tl_inode->i_rwsem */
 int __ocfs2_flush_truncate_log(struct ocfs2_super *osb)
 {
 	int status;
@@ -7427,7 +7427,7 @@ int ocfs2_truncate_inline(struct inode *inode, struct buffer_head *di_bh,
 	/*
 	 * No need to worry about the data page here - it's been
 	 * truncated already and inline data doesn't need it for
-	 * pushing zero's to disk, so we'll let readpage pick it up
+	 * pushing zero's to disk, so we'll let read_folio pick it up
 	 * later.
 	 */
 	if (trunc) {
@@ -7436,10 +7436,10 @@ int ocfs2_truncate_inline(struct inode *inode, struct buffer_head *di_bh,
 	}
 
 	inode->i_blocks = ocfs2_inode_sector_count(inode);
-	inode->i_ctime = inode->i_mtime = current_time(inode);
+	inode->i_mtime = inode_set_ctime_current(inode);
 
-	di->i_ctime = di->i_mtime = cpu_to_le64(inode->i_ctime.tv_sec);
-	di->i_ctime_nsec = di->i_mtime_nsec = cpu_to_le32(inode->i_ctime.tv_nsec);
+	di->i_ctime = di->i_mtime = cpu_to_le64(inode_get_ctime(inode).tv_sec);
+	di->i_ctime_nsec = di->i_mtime_nsec = cpu_to_le32(inode_get_ctime(inode).tv_nsec);
 
 	ocfs2_update_inode_fsync_trans(handle, inode, 1);
 	ocfs2_journal_dirty(handle, di_bh);

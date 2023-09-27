@@ -18,10 +18,8 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/module.h>
-#include <linux/of_address.h>
-#include <linux/of_device.h>
-#include <linux/of_platform.h>
-#include <linux/of_irq.h>
+#include <linux/of.h>
+#include <linux/platform_device.h>
 #include <linux/prefetch.h>
 #include <linux/usb/ch9.h>
 #include <linux/usb/gadget.h>
@@ -192,7 +190,7 @@ struct xusb_udc {
 	bool dma_enabled;
 	struct clk *clk;
 
-	unsigned int (*read_fn)(void __iomem *);
+	unsigned int (*read_fn)(void __iomem *reg);
 	void (*write_fn)(void __iomem *, u32, u32);
 };
 
@@ -632,7 +630,7 @@ top:
 		dev_dbg(udc->dev, "read %s, %d bytes%s req %p %d/%d\n",
 			ep->ep_usb.name, count, is_short ? "/S" : "", req,
 			req->usb_req.actual, req->usb_req.length);
-		bufferspace -= count;
+
 		/* Completion */
 		if ((req->usb_req.actual == req->usb_req.length) || is_short) {
 			if (udc->dma_enabled && req->usb_req.length)
@@ -1136,17 +1134,20 @@ static int xudc_ep_queue(struct usb_ep *_ep, struct usb_request *_req,
 static int xudc_ep_dequeue(struct usb_ep *_ep, struct usb_request *_req)
 {
 	struct xusb_ep *ep	= to_xusb_ep(_ep);
-	struct xusb_req *req	= to_xusb_req(_req);
+	struct xusb_req *req	= NULL;
+	struct xusb_req *iter;
 	struct xusb_udc *udc	= ep->udc;
 	unsigned long flags;
 
 	spin_lock_irqsave(&udc->lock, flags);
 	/* Make sure it's actually queued on this endpoint */
-	list_for_each_entry(req, &ep->queue, queue) {
-		if (&req->usb_req == _req)
-			break;
+	list_for_each_entry(iter, &ep->queue, queue) {
+		if (&iter->usb_req != _req)
+			continue;
+		req = iter;
+		break;
 	}
-	if (&req->usb_req != _req) {
+	if (!req) {
 		spin_unlock_irqrestore(&udc->lock, flags);
 		return -EINVAL;
 	}
@@ -1614,13 +1615,13 @@ static void xudc_getstatus(struct xusb_udc *udc)
 	case USB_RECIP_INTERFACE:
 		break;
 	case USB_RECIP_ENDPOINT:
-		epnum = udc->setup.wIndex & USB_ENDPOINT_NUMBER_MASK;
+		epnum = le16_to_cpu(udc->setup.wIndex) & USB_ENDPOINT_NUMBER_MASK;
 		if (epnum >= XUSB_MAX_ENDPOINTS)
 			goto stall;
 		target_ep = &udc->ep[epnum];
 		epcfgreg = udc->read_fn(udc->addr + target_ep->offset);
 		halt = epcfgreg & XUSB_EP_CFG_STALL_MASK;
-		if (udc->setup.wIndex & USB_DIR_IN) {
+		if (le16_to_cpu(udc->setup.wIndex) & USB_DIR_IN) {
 			if (!target_ep->is_in)
 				goto stall;
 		} else {
@@ -1635,7 +1636,7 @@ static void xudc_getstatus(struct xusb_udc *udc)
 	}
 
 	req->usb_req.length = 2;
-	*(u16 *)req->usb_req.buf = cpu_to_le16(status);
+	*(__le16 *)req->usb_req.buf = cpu_to_le16(status);
 	ret = __xudc_ep0_queue(ep0, req);
 	if (ret == 0)
 		return;
@@ -1663,7 +1664,7 @@ static void xudc_set_clear_feature(struct xusb_udc *udc)
 
 	switch (udc->setup.bRequestType) {
 	case USB_RECIP_DEVICE:
-		switch (udc->setup.wValue) {
+		switch (le16_to_cpu(udc->setup.wValue)) {
 		case USB_DEVICE_TEST_MODE:
 			/*
 			 * The Test Mode will be executed
@@ -1683,13 +1684,15 @@ static void xudc_set_clear_feature(struct xusb_udc *udc)
 		break;
 	case USB_RECIP_ENDPOINT:
 		if (!udc->setup.wValue) {
-			endpoint = udc->setup.wIndex & USB_ENDPOINT_NUMBER_MASK;
+			endpoint = le16_to_cpu(udc->setup.wIndex) &
+					       USB_ENDPOINT_NUMBER_MASK;
 			if (endpoint >= XUSB_MAX_ENDPOINTS) {
 				xudc_ep0_stall(udc);
 				return;
 			}
 			target_ep = &udc->ep[endpoint];
-			outinbit = udc->setup.wIndex & USB_ENDPOINT_DIR_MASK;
+			outinbit = le16_to_cpu(udc->setup.wIndex) &
+					       USB_ENDPOINT_DIR_MASK;
 			outinbit = outinbit >> 7;
 
 			/* Make sure direction matches.*/
@@ -1752,9 +1755,9 @@ static void xudc_handle_setup(struct xusb_udc *udc)
 	memcpy(&setup, ep0rambase, 8);
 
 	udc->setup = setup;
-	udc->setup.wValue = cpu_to_le16(setup.wValue);
-	udc->setup.wIndex = cpu_to_le16(setup.wIndex);
-	udc->setup.wLength = cpu_to_le16(setup.wLength);
+	udc->setup.wValue = cpu_to_le16((u16 __force)setup.wValue);
+	udc->setup.wIndex = cpu_to_le16((u16 __force)setup.wIndex);
+	udc->setup.wLength = cpu_to_le16((u16 __force)setup.wLength);
 
 	/* Clear previous requests */
 	xudc_nuke(ep0, -ECONNRESET);
@@ -1866,7 +1869,7 @@ static void xudc_ep0_in(struct xusb_udc *udc)
 	u16 count = 0;
 	u16 length;
 	u8 *ep0rambase;
-	u8 test_mode = udc->setup.wIndex >> 8;
+	u8 test_mode = le16_to_cpu(udc->setup.wIndex) >> 8;
 
 	req = list_first_entry(&ep0->queue, struct xusb_req, queue);
 	bytes_to_tx = req->usb_req.length - req->usb_req.actual;
@@ -1877,12 +1880,12 @@ static void xudc_ep0_in(struct xusb_udc *udc)
 		case USB_REQ_SET_ADDRESS:
 			/* Set the address of the device.*/
 			udc->write_fn(udc->addr, XUSB_ADDRESS_OFFSET,
-				      udc->setup.wValue);
+				      le16_to_cpu(udc->setup.wValue));
 			break;
 		case USB_REQ_SET_FEATURE:
 			if (udc->setup.bRequestType ==
 					USB_RECIP_DEVICE) {
-				if (udc->setup.wValue ==
+				if (le16_to_cpu(udc->setup.wValue) ==
 						USB_DEVICE_TEST_MODE)
 					udc->write_fn(udc->addr,
 						      XUSB_TESTMODE_OFFSET,
@@ -2077,8 +2080,7 @@ static int xudc_probe(struct platform_device *pdev)
 	udc->req->usb_req.buf = buff;
 
 	/* Map the registers */
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	udc->addr = devm_ioremap_resource(&pdev->dev, res);
+	udc->addr = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(udc->addr))
 		return PTR_ERR(udc->addr);
 
@@ -2175,14 +2177,12 @@ fail:
  *
  * Return: 0 always
  */
-static int xudc_remove(struct platform_device *pdev)
+static void xudc_remove(struct platform_device *pdev)
 {
 	struct xusb_udc *udc = platform_get_drvdata(pdev);
 
 	usb_del_gadget_udc(&udc->gadget);
 	clk_disable_unprepare(udc->clk);
-
-	return 0;
 }
 
 #ifdef CONFIG_PM_SLEEP
@@ -2254,7 +2254,7 @@ static struct platform_driver xudc_driver = {
 		.pm	= &xudc_pm_ops,
 	},
 	.probe = xudc_probe,
-	.remove = xudc_remove,
+	.remove_new = xudc_remove,
 };
 
 module_platform_driver(xudc_driver);

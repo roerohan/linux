@@ -24,6 +24,7 @@
 #include <linux/bug.h>
 #include <linux/mm.h>
 #include <linux/mmzone.h>
+#include <linux/kfence.h>
 
 static void *trans_alloc(struct trans_pgd_info *info)
 {
@@ -40,8 +41,9 @@ static void _copy_pte(pte_t *dst_ptep, pte_t *src_ptep, unsigned long addr)
 		 * read only (code, rodata). Clear the RDONLY bit from
 		 * the temporary mappings we use during restore.
 		 */
-		set_pte(dst_ptep, pte_mkwrite(pte));
-	} else if (debug_pagealloc_enabled() && !pte_none(pte)) {
+		set_pte(dst_ptep, pte_mkwrite_novma(pte));
+	} else if ((debug_pagealloc_enabled() ||
+		   is_kfence_address((void *)addr)) && !pte_none(pte)) {
 		/*
 		 * debug_pagealloc will removed the PTE_VALID bit if
 		 * the page isn't in use by the resume kernel. It may have
@@ -53,7 +55,7 @@ static void _copy_pte(pte_t *dst_ptep, pte_t *src_ptep, unsigned long addr)
 		 */
 		BUG_ON(!pfn_valid(pte_pfn(pte)));
 
-		set_pte(dst_ptep, pte_mkpresent(pte_mkwrite(pte)));
+		set_pte(dst_ptep, pte_mkpresent(pte_mkwrite_novma(pte)));
 	}
 }
 
@@ -238,7 +240,7 @@ int trans_pgd_idmap_page(struct trans_pgd_info *info, phys_addr_t *trans_ttbr0,
 	int this_level, index, level_lsb, level_msb;
 
 	dst_addr &= PAGE_MASK;
-	prev_level_entry = pte_val(pfn_pte(pfn, PAGE_KERNEL_EXEC));
+	prev_level_entry = pte_val(pfn_pte(pfn, PAGE_KERNEL_ROX));
 
 	for (this_level = 3; this_level >= 0; this_level--) {
 		levels[this_level] = trans_alloc(info);
